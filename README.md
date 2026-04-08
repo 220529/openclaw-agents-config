@@ -32,7 +32,7 @@ Do not commit live secrets.
 Keep real values outside the repository, for example in:
 
 - `~/.config/openclaw/openclaw.env`
-- `${OPENCLAW_HOME}/qq-yunxiao-deploy.conf`
+- `${OPENCLAW_STATE_DIR}/qq-yunxiao-deploy.conf`
 - token files referenced by those configs
 
 The repository only keeps examples and templates.
@@ -46,9 +46,15 @@ The repository only keeps examples and templates.
 5. Run `bootstrap/doctor.sh`.
 6. If needed, restart the gateway with `bootstrap/install.sh --restart`.
 
+Important machine-specific values:
+
+- `OPENCLAW_NODE_BIN`
+- `OPENCLAW_NODE_MODULES_DIR`
+
+These usually come from the machine's global Node/OpenClaw installation.
+
 ## Current Contract
 
 - Action commands: 10
 - Help commands: 2
 - Historical long phrases: retired, confirmation only
-

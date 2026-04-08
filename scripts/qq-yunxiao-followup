@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-openclaw_home="${OPENCLAW_HOME:-${HOME:-/root}/.openclaw}"
-openclaw_workspace="${OPENCLAW_WORKSPACE:-${openclaw_home}/workspace}"
-config_path="${QQ_YUNXIAO_DEPLOY_CONFIG:-${openclaw_home}/qq-yunxiao-deploy.conf}"
+openclaw_state_dir="${OPENCLAW_STATE_DIR:-${HOME:-/root}/.openclaw}"
+openclaw_workspace="${OPENCLAW_WORKSPACE:-${openclaw_state_dir}/workspace}"
+config_path="${QQ_YUNXIAO_DEPLOY_CONFIG:-${openclaw_state_dir}/qq-yunxiao-deploy.conf}"
 notify_to="${1:-}"
 timeout_sec="${2:-1800}"
 poll_interval_sec="${3:-15}"

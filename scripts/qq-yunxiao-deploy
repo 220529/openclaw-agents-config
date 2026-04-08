@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-openclaw_home="${OPENCLAW_HOME:-${HOME:-/root}/.openclaw}"
-openclaw_workspace="${OPENCLAW_WORKSPACE:-${openclaw_home}/workspace}"
-default_config="${openclaw_home}/qq-yunxiao-deploy.conf"
+openclaw_state_dir="${OPENCLAW_STATE_DIR:-${HOME:-/root}/.openclaw}"
+openclaw_workspace="${OPENCLAW_WORKSPACE:-${openclaw_state_dir}/workspace}"
+default_config="${openclaw_state_dir}/qq-yunxiao-deploy.conf"
 template_config="${openclaw_workspace}/.openclaw/qq-yunxiao-deploy.conf.example"
 
 config_path="${QQ_YUNXIAO_DEPLOY_CONFIG:-$default_config}"
@@ -28,7 +28,7 @@ usage() {
   qq-yunxiao-deploy [all|backend|frontend|<target>]
 
 说明:
-  - 默认读取 ${OPENCLAW_HOME:-~/.openclaw}/qq-yunxiao-deploy.conf
+  - 默认读取 ${OPENCLAW_STATE_DIR:-~/.openclaw}/qq-yunxiao-deploy.conf
   - 支持的动作:
     - create_run
     - pass_validate

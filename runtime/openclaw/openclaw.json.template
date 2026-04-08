@@ -10,8 +10,7 @@
       }
     },
     "mode": "local",
-    "bind": "custom",
-    "customBindHost": "127.0.0.1",
+    "bind": "loopback",
     "controlUi": {
       "allowedOrigins": [
         "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}",
@@ -60,4 +59,3 @@
     }
   }
 }
-

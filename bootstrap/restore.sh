@@ -33,8 +33,8 @@ set -a
 set +a
 
 codex_home="${CODEX_HOME:-${HOME}/.codex}"
-openclaw_home="${OPENCLAW_HOME:-${HOME}/.openclaw}"
-openclaw_workspace="${OPENCLAW_WORKSPACE:-${openclaw_home}/workspace}"
+openclaw_state_dir="${OPENCLAW_STATE_DIR:-${HOME}/.openclaw}"
+openclaw_workspace="${OPENCLAW_WORKSPACE:-${openclaw_state_dir}/workspace}"
 systemd_user_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
 
 mkdir -p \
@@ -60,7 +60,7 @@ chmod +x \
 
 python3 "${repo_root}/bootstrap/render_template.py" \
   "${repo_root}/runtime/openclaw/openclaw.json.template" \
-  "${openclaw_home}/openclaw.json"
+  "${openclaw_state_dir}/openclaw.json"
 
 python3 "${repo_root}/bootstrap/render_template.py" \
   "${repo_root}/runtime/systemd/openclaw-gateway.service.template" \
@@ -76,5 +76,5 @@ fi
 echo "restored config into:"
 echo "  skill: ${codex_home}/skills/3ms-workspace-ops"
 echo "  workspace: ${openclaw_workspace}"
-echo "  config: ${openclaw_home}/openclaw.json"
+echo "  config: ${openclaw_state_dir}/openclaw.json"
 echo "  service: ${systemd_user_dir}/openclaw-gateway.service"

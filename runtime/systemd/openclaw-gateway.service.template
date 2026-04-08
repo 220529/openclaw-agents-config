@@ -10,7 +10,7 @@ EnvironmentFile=%h/.config/openclaw/openclaw.env
 Environment=HOME=${HOME}
 Environment=TMPDIR=/tmp
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin
-ExecStart=/usr/bin/env bash -lc 'node "$(npm root -g)/openclaw/dist/index.js" gateway --port "${OPENCLAW_GATEWAY_PORT}"'
+ExecStart=/usr/bin/env bash -lc '"${OPENCLAW_NODE_BIN}" "${OPENCLAW_NODE_MODULES_DIR}/openclaw/dist/index.js" gateway --port "${OPENCLAW_GATEWAY_PORT}"'
 Restart=always
 RestartSec=5
 TimeoutStopSec=30
@@ -20,4 +20,3 @@ KillMode=control-group
 
 [Install]
 WantedBy=default.target
-

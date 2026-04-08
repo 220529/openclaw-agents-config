@@ -14,15 +14,15 @@ set -a
 set +a
 
 codex_home="${CODEX_HOME:-${HOME}/.codex}"
-openclaw_home="${OPENCLAW_HOME:-${HOME}/.openclaw}"
-openclaw_workspace="${OPENCLAW_WORKSPACE:-${openclaw_home}/workspace}"
+openclaw_state_dir="${OPENCLAW_STATE_DIR:-${HOME}/.openclaw}"
+openclaw_workspace="${OPENCLAW_WORKSPACE:-${openclaw_state_dir}/workspace}"
 service_file="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user/openclaw-gateway.service"
 
 required=(
   "${codex_home}/skills/3ms-workspace-ops/SKILL.md"
   "${openclaw_workspace}/bin/qq-3ms-intent"
   "${openclaw_workspace}/profiles/qq/default-tech-assistant.md"
-  "${openclaw_home}/openclaw.json"
+  "${openclaw_state_dir}/openclaw.json"
   "${service_file}"
 )
 
@@ -33,8 +33,7 @@ for path in "${required[@]}"; do
   fi
 done
 
-python3 -m json.tool "${openclaw_home}/openclaw.json" >/dev/null
+python3 -m json.tool "${openclaw_state_dir}/openclaw.json" >/dev/null
 bash -n "${openclaw_workspace}/bin/qq-3ms-intent"
 
 echo "doctor ok"
-
