@@ -12,7 +12,9 @@ Handle the fixed set of 3ms Git workflows for the active agent workspace. Treat 
 ## Quick Start
 
 1. Read [references/intent-map.md](references/intent-map.md) to map the user phrase to a canonical intent.
-2. Prefer the installed `qq-3ms-intent <intent>` entrypoint as the unified executor for these requests.
+2. Prefer the installed `qq-3ms-intent` entrypoint as the unified executor for these requests.
+   - For exact fixed commands, pass the exact Chinese command text verbatim, for example `qq-3ms-intent "拉取上游仓库并部署"`.
+   - For the branch template, pass the full command text, for example `qq-3ms-intent "切分支 v0.0.3"`.
 3. Let `qq-3ms-intent` delegate internally to:
    - `/root/.openclaw/workspace/bin/qq-upstream-status`
    - `/root/.openclaw/workspace/bin/qq-update-workspace`
@@ -27,6 +29,7 @@ Handle the fixed set of 3ms Git workflows for the active agent workspace. Treat 
   - `upstream` means the GitHub upstream of `sub2api-main`.
   - `origin` means the user's own remote branch.
 - Only auto-execute the exact QQ commands listed in `references/intent-map.md`.
+  - When calling `qq-3ms-intent` from a chat runtime, pass the exact fixed command text verbatim; do not manually translate it to a numeric intent id.
   - If the user sends old jargon or a similar but non-exact phrase such as `更新下吧`, `拉一下主项目 origin`, or `同步一下上游`, do not execute it directly.
   - When one fixed command is the clear high-confidence match, reply with that candidate and ask for exact confirmation.
   - When multiple fixed commands are plausible, offer 2 to 3 exact fixed-command options and wait.

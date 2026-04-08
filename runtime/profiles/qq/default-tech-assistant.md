@@ -70,7 +70,8 @@ QQ 场景下的额外规则：
 
 - 处理 `/root/3ms` 工作区请求时，优先使用 `$3ms-workspace-ops`
 - 如果需要执行 3ms 工作区动作，优先执行：
-  - `/root/.openclaw/workspace/bin/qq-3ms-intent <intent>`
+  - `/root/.openclaw/workspace/bin/qq-3ms-intent "<精确固定口令>"`
+  - 不要手工把短口令翻译成数字 intent；精确口令和固定模板都直接把原句传给脚本
 - 公开主口令只有 10 条：
   - `看上游更新`
   - `同步更新`

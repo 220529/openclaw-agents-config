@@ -166,7 +166,7 @@ fail() {
 
 normalize_intent() {
   case "$1" in
-    1|check-upstream-status|check-upstream|upstream-status)
+    1|check-upstream-status|check-upstream|upstream-status|"看上游更新")
       printf 'check-upstream-status'
       ;;
     2|merge-upstream-main|merge-upstream)
@@ -181,40 +181,40 @@ normalize_intent() {
     5|sync-children-push|sync-child-repos-push)
       printf 'sync-children-push'
       ;;
-    6|update-all|full-update)
+    6|update-all|full-update|"同步更新")
       printf 'update-all'
       ;;
-    7|pull-main-origin|pull-origin-main)
+    7|pull-main-origin|pull-origin-main|"拉取主项目")
       printf 'pull-main-origin'
       ;;
     8|pull-main-origin-sync-children-push|pull-origin-main-sync-children-push)
       printf 'pull-main-origin-sync-children-push'
       ;;
-    9|deploy-yunxiao|yunxiao-deploy|deploy)
+    9|deploy-yunxiao|yunxiao-deploy|deploy|"执行部署")
       printf 'deploy-yunxiao'
       ;;
-    10|update-all-deploy-yunxiao|full-update-deploy|update-deploy)
+    10|update-all-deploy-yunxiao|full-update-deploy|update-deploy|"拉取上游仓库并部署")
       printf 'update-all-deploy-yunxiao'
       ;;
-    11|check-main-branch|main-branch|show-main-branch|check-workspace-branches|workspace-branches|show-workspace-branches)
+    11|check-main-branch|main-branch|show-main-branch|check-workspace-branches|workspace-branches|show-workspace-branches|"看分支")
       printf 'check-main-branch'
       ;;
-    12|switch-workspace-branch|switch-branch|workspace-switch-branch)
+    12|switch-workspace-branch|switch-branch|workspace-switch-branch|"切分支")
       printf 'switch-workspace-branch'
       ;;
-    13|check-deploy-readiness|deploy-readiness|check-deploy-ready)
+    13|check-deploy-readiness|deploy-readiness|check-deploy-ready|"部署前检查")
       printf 'check-deploy-readiness'
       ;;
-    14|list-main-branches|list-branches|show-branches|main-branches)
+    14|list-main-branches|list-branches|show-branches|main-branches|"列分支")
       printf 'list-main-branches'
       ;;
-    15|list-command-summary|command-summary|commands-summary)
+    15|list-command-summary|command-summary|commands-summary|"口令")
       printf 'list-command-summary'
       ;;
-    16|list-fixed-commands|list-commands|show-commands|commands)
+    16|list-fixed-commands|list-commands|show-commands|commands|"列出所有口令")
       printf 'list-fixed-commands'
       ;;
-    17|pull-main-origin-sync-children-push-deploy-yunxiao|pull-origin-main-sync-children-push-deploy-yunxiao|pull-origin-main-deploy)
+    17|pull-main-origin-sync-children-push-deploy-yunxiao|pull-origin-main-sync-children-push-deploy-yunxiao|pull-origin-main-deploy|"拉取主项目并部署")
       printf 'pull-main-origin-sync-children-push-deploy-yunxiao'
       ;;
     *)
@@ -1233,6 +1233,11 @@ fi
 if [[ -z "$intent_arg" || "$intent_arg" == "-h" || "$intent_arg" == "--help" || "$intent_arg" == "help" ]]; then
   usage
   exit 0
+fi
+
+if [[ -z "$branch_arg" && "$intent_arg" == "切分支 "* ]]; then
+  branch_arg="${intent_arg#切分支 }"
+  intent_arg="切分支"
 fi
 
 intent="$(normalize_intent "$intent_arg")" || {

@@ -20,7 +20,8 @@
 - 同步说明文档：`/root/3ms/sub2api-main/docs/3ms工作区同步说明.md`
 - 主责：3ms 工作区相关的代码、同步、部署、运维、脚本、日志与排障
 - 处理这些请求时，优先使用 `$3ms-workspace-ops`
-- 如需执行动作，优先执行 `/root/.openclaw/workspace/bin/qq-3ms-intent <intent>`
+- 如需执行动作，优先执行 `/root/.openclaw/workspace/bin/qq-3ms-intent "<精确固定口令>"`
+- 不要手工把短口令翻译成数字 intent；精确口令和固定模板都直接把原句传给脚本
 - 如果脚本输出 `QQ_DETAIL_1`、`QQ_DETAIL_2` 这类分行字段，按编号顺序逐行回，不要压成一段
 
 说话方式：
