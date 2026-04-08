@@ -1,0 +1,1311 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+openclaw_home="${OPENCLAW_HOME:-${HOME:-/root}/.openclaw}"
+openclaw_workspace="${OPENCLAW_WORKSPACE:-${openclaw_home}/workspace}"
+workspace="${THREEMS_WORKSPACE:-${WORKSPACE_ROOT:-/root/3ms}}"
+main_repo="${THREEMS_MAIN_REPO:-${workspace}/sub2api-main}"
+backend_repo="${THREEMS_BACKEND_REPO:-${workspace}/3ms_backend}"
+frontend_repo="${THREEMS_FRONTEND_REPO:-${workspace}/3ms_frontend}"
+
+upstream_status_script="${QQ_UPSTREAM_STATUS_SCRIPT:-${openclaw_workspace}/bin/qq-upstream-status}"
+update_all_script="${QQ_UPDATE_WORKSPACE_SCRIPT:-${openclaw_workspace}/bin/qq-update-workspace}"
+deploy_yunxiao_script="${QQ_YUNXIAO_DEPLOY_SCRIPT:-${openclaw_workspace}/bin/qq-yunxiao-deploy}"
+proactive_send_script="${QQBOT_PROACTIVE_SEND_SCRIPT:-${openclaw_workspace}/bin/qqbot-proactive-send}"
+sync_backend_script="${main_repo}/scripts/sync-backend.sh"
+sync_frontend_script="${main_repo}/scripts/sync-frontend.sh"
+yunxiao_deploy_config="${openclaw_home}/qq-yunxiao-deploy.conf"
+
+intent_arg="${1:-}"
+branch_arg="${2:-}"
+intent=""
+target_branch=""
+main_before=""
+main_after=""
+pull_before=""
+pull_after=""
+pull_ahead_count="0"
+pull_behind_count="0"
+declared_main_sha=""
+
+discarded_repos=()
+changed_children=()
+unchanged_children=()
+pushed_repos=()
+fetched_repos=()
+progress_notify_to=""
+progress_notify_loaded="0"
+public_commands=(
+  "看上游更新"
+  "同步更新"
+  "拉取上游仓库并部署"
+  "拉取主项目"
+  "拉取主项目并部署"
+  "看分支"
+  "列分支"
+  "切分支 <branch>"
+  "部署前检查"
+  "执行部署"
+)
+help_commands=(
+  "口令"
+  "列出所有口令"
+)
+fixed_commands=("${public_commands[@]}" "${help_commands[@]}")
+
+usage() {
+  cat <<'EOF'
+用法:
+  qq-3ms-intent <intent>
+
+支持的 intent:
+  1 | check-upstream-status
+  2 | merge-upstream-main
+  3 | sync-children
+  4 | merge-upstream-main-push
+  5 | sync-children-push
+  6 | update-all
+  7 | pull-main-origin
+  8 | pull-main-origin-sync-children-push
+  9 | deploy-yunxiao
+  10 | update-all-deploy-yunxiao
+  11 | check-main-branch
+  12 | switch-workspace-branch <branch>
+  13 | check-deploy-readiness
+  14 | list-main-branches
+  15 | list-command-summary
+  16 | list-fixed-commands
+  17 | pull-main-origin-sync-children-push-deploy-yunxiao
+EOF
+}
+
+join_by() {
+  local sep="$1"
+  shift
+  local out=""
+  local item
+  for item in "$@"; do
+    if [[ -z "$out" ]]; then
+      out="$item"
+    else
+      out="${out}${sep}${item}"
+    fi
+  done
+  printf '%s' "$out"
+}
+
+first_nonempty_line() {
+  local file="$1"
+  sed -n '/[^[:space:]]/ { p; q; }' "$file"
+}
+
+best_error_line() {
+  local file="$1"
+  local line
+
+  line="$(sed -n '/^ssh:/ { p; q; }' "$file")"
+  if [[ -n "$line" ]]; then
+    printf '%s' "$line"
+    return 0
+  fi
+
+  line="$(sed -n '/^fatal:/ { p; q; }' "$file")"
+  if [[ -n "$line" ]]; then
+    printf '%s' "$line"
+    return 0
+  fi
+
+  line="$(sed -n '/^error:/I { p; q; }' "$file")"
+  if [[ -n "$line" ]]; then
+    printf '%s' "$line"
+    return 0
+  fi
+
+  line="$(sed -n '/conflict/I { p; q; }' "$file")"
+  if [[ -n "$line" ]]; then
+    printf '%s' "$line"
+    return 0
+  fi
+
+  line="$(sed -n '/denied/I { p; q; }' "$file")"
+  if [[ -n "$line" ]]; then
+    printf '%s' "$line"
+    return 0
+  fi
+
+  line="$(sed -n '/not possible to fast-forward/I { p; q; }' "$file")"
+  if [[ -n "$line" ]]; then
+    printf '%s' "$line"
+    return 0
+  fi
+
+  line="$(first_nonempty_line "$file")"
+  printf '%s' "$line"
+}
+
+kv_value() {
+  local key="$1"
+  local file="$2"
+  sed -n "s/^${key}=//p" "$file" | sed -n '1p'
+}
+
+fail() {
+  local error_code="$1"
+  local exit_code="$2"
+  local result="$3"
+  local detail="${4:-}"
+
+  echo "INTENT=${intent}"
+  echo "QQ_RESULT=${result}"
+  if [[ -n "$detail" ]]; then
+    echo "QQ_DETAIL=${detail}"
+  fi
+  echo "ERROR=${error_code}"
+  exit "$exit_code"
+}
+
+normalize_intent() {
+  case "$1" in
+    1|check-upstream-status|check-upstream|upstream-status)
+      printf 'check-upstream-status'
+      ;;
+    2|merge-upstream-main|merge-upstream)
+      printf 'merge-upstream-main'
+      ;;
+    3|sync-children|sync-child-repos)
+      printf 'sync-children'
+      ;;
+    4|merge-upstream-main-push|merge-upstream-push)
+      printf 'merge-upstream-main-push'
+      ;;
+    5|sync-children-push|sync-child-repos-push)
+      printf 'sync-children-push'
+      ;;
+    6|update-all|full-update)
+      printf 'update-all'
+      ;;
+    7|pull-main-origin|pull-origin-main)
+      printf 'pull-main-origin'
+      ;;
+    8|pull-main-origin-sync-children-push|pull-origin-main-sync-children-push)
+      printf 'pull-main-origin-sync-children-push'
+      ;;
+    9|deploy-yunxiao|yunxiao-deploy|deploy)
+      printf 'deploy-yunxiao'
+      ;;
+    10|update-all-deploy-yunxiao|full-update-deploy|update-deploy)
+      printf 'update-all-deploy-yunxiao'
+      ;;
+    11|check-main-branch|main-branch|show-main-branch|check-workspace-branches|workspace-branches|show-workspace-branches)
+      printf 'check-main-branch'
+      ;;
+    12|switch-workspace-branch|switch-branch|workspace-switch-branch)
+      printf 'switch-workspace-branch'
+      ;;
+    13|check-deploy-readiness|deploy-readiness|check-deploy-ready)
+      printf 'check-deploy-readiness'
+      ;;
+    14|list-main-branches|list-branches|show-branches|main-branches)
+      printf 'list-main-branches'
+      ;;
+    15|list-command-summary|command-summary|commands-summary)
+      printf 'list-command-summary'
+      ;;
+    16|list-fixed-commands|list-commands|show-commands|commands)
+      printf 'list-fixed-commands'
+      ;;
+    17|pull-main-origin-sync-children-push-deploy-yunxiao|pull-origin-main-sync-children-push-deploy-yunxiao|pull-origin-main-deploy)
+      printf 'pull-main-origin-sync-children-push-deploy-yunxiao'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+trim_sentence() {
+  local text="${1:-}"
+  text="${text%。}"
+  text="${text%.}"
+  printf '%s' "$text"
+}
+
+strip_update_not_deployed() {
+  local text
+  text="$(trim_sentence "${1:-}")"
+  text="${text%；未部署}"
+  printf '%s' "$text"
+}
+
+branch_line() {
+  local repo="$1"
+  local ref_prefix="$2"
+  local strip_prefix="$3"
+  local lines=()
+  local line
+
+  while IFS= read -r line; do
+    line="${line#${strip_prefix}}"
+    if [[ -z "$line" || "$line" == "HEAD" || "$line" == "origin" ]]; then
+      continue
+    fi
+    lines+=("$line")
+  done < <(git -C "$repo" for-each-ref --format='%(refname:short)' "$ref_prefix" | sort -u)
+
+  if [[ "${#lines[@]}" -eq 0 ]]; then
+    printf '无'
+  else
+    join_by '、' "${lines[@]}"
+  fi
+}
+
+bool_true() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+load_progress_notify_target() {
+  local config_path
+
+  if [[ "$progress_notify_loaded" == "1" ]]; then
+    return 0
+  fi
+  progress_notify_loaded="1"
+
+  config_path="${QQ_YUNXIAO_DEPLOY_CONFIG:-$yunxiao_deploy_config}"
+  if [[ ! -f "$config_path" ]]; then
+    return 0
+  fi
+
+  # shellcheck disable=SC1090
+  . "$config_path"
+  if bool_true "${YUNXIAO_NOTIFY_ON_FINISH:-0}" && [[ -n "${YUNXIAO_NOTIFY_TO:-}" ]]; then
+    progress_notify_to="${YUNXIAO_NOTIFY_TO}"
+  fi
+}
+
+send_progress_notify() {
+  local text="$1"
+
+  load_progress_notify_target
+  if [[ -z "$progress_notify_to" || ! -x "$proactive_send_script" ]]; then
+    return 0
+  fi
+
+  "$proactive_send_script" "$progress_notify_to" "$text" >/dev/null 2>&1 || true
+}
+
+repo_status() {
+  local repo="$1"
+  git -C "$repo" status --porcelain
+}
+
+current_branch() {
+  local repo="$1"
+  git -C "$repo" branch --show-current
+}
+
+display_branch() {
+  local repo="$1"
+  local branch
+  local sha
+
+  branch="$(current_branch "$repo" || true)"
+  if [[ -n "$branch" ]]; then
+    printf '%s' "$branch"
+    return 0
+  fi
+
+  sha="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || true)"
+  if [[ -n "$sha" ]]; then
+    printf 'DETACHED@%s' "$sha"
+    return 0
+  fi
+
+  return 1
+}
+
+origin_branch_label() {
+  printf 'origin/%s' "$target_branch"
+}
+
+ensure_main_branch() {
+  target_branch="$(current_branch "$main_repo" || true)"
+  if [[ -z "$target_branch" ]]; then
+    fail "main_branch_unknown" 10 "这次没法继续，主仓库当前不是本地分支。"
+  fi
+  echo "TARGET_BRANCH=${target_branch}"
+}
+
+ensure_requested_branch() {
+  target_branch="${branch_arg}"
+  if [[ -z "$target_branch" ]]; then
+    fail "target_branch_missing" 10 "这次没法继续，缺少目标分支。" "请使用：切分支 <branch>"
+  fi
+  if ! git check-ref-format --branch "$target_branch" >/dev/null 2>&1; then
+    fail "target_branch_invalid" 10 "这次没法继续，目标分支名不合法。" "${target_branch}"
+  fi
+  echo "TARGET_BRANCH=${target_branch}"
+}
+
+ensure_origin_remote() {
+  local repo="$1"
+  local label="$2"
+  if ! git -C "$repo" remote get-url origin >/dev/null 2>&1; then
+    fail "${label}_origin_missing" 11 "这次没法继续，${label} 没配置 origin。"
+  fi
+}
+
+ensure_upstream_remote() {
+  if ! git -C "$main_repo" remote get-url upstream >/dev/null 2>&1; then
+    fail "upstream_missing" 12 "这次没法继续，主仓库没配置 upstream。"
+  fi
+}
+
+load_deploy_config_for_check() {
+  local config_path="${QQ_YUNXIAO_DEPLOY_CONFIG:-$yunxiao_deploy_config}"
+
+  if [[ ! -f "$config_path" ]]; then
+    fail "deploy_config_missing" 12 "这次没法确认当前分支是否可部署。" "缺少云效配置文件：${config_path}"
+  fi
+
+  # shellcheck disable=SC1090
+  . "$config_path"
+}
+
+discard_repo_changes() {
+  local label="$1"
+  local repo="$2"
+  local status
+  local safe_name
+  local reset_log
+  local clean_log
+
+  status="$(repo_status "$repo")"
+  if [[ -z "$status" ]]; then
+    return 0
+  fi
+
+  safe_name="${label//[^A-Za-z0-9_.-]/_}"
+  reset_log="/tmp/qq-3ms-intent.${safe_name}.reset.log"
+  clean_log="/tmp/qq-3ms-intent.${safe_name}.clean.log"
+
+  if ! git -C "$repo" reset --hard HEAD >"$reset_log" 2>&1; then
+    fail "discard_failed" 13 "这次没法继续，${label} 丢弃本地改动失败。" "$(best_error_line "$reset_log")"
+  fi
+  if ! git -C "$repo" clean -fd >"$clean_log" 2>&1; then
+    fail "discard_failed" 13 "这次没法继续，${label} 清理未跟踪文件失败。" "$(best_error_line "$clean_log")"
+  fi
+
+  discarded_repos+=("$label")
+}
+
+fetch_repo_branch() {
+  local repo="$1"
+  local label="$2"
+  local safe_name
+  local fetch_log
+
+  ensure_origin_remote "$repo" "$label"
+
+  safe_name="${label//[^A-Za-z0-9_.-]/_}"
+  fetch_log="/tmp/qq-3ms-intent.${safe_name}.fetch-branch.log"
+
+  if ! git -C "$repo" fetch origin "refs/heads/${target_branch}:refs/remotes/origin/${target_branch}" >"$fetch_log" 2>&1; then
+    fail "${safe_name}_fetch_branch_failed" 14 "这次没法继续，${label} 拉取目标分支失败。" "$(best_error_line "$fetch_log")"
+  fi
+
+  fetched_repos+=("$label")
+}
+
+check_repo_branch_on_origin() {
+  local repo="$1"
+  local label="$2"
+  local safe_name
+  local check_log
+  local check_exit
+
+  ensure_origin_remote "$repo" "$label"
+
+  safe_name="${label//[^A-Za-z0-9_.-]/_}"
+  check_log="/tmp/qq-3ms-intent.${safe_name}.ls-remote.log"
+
+  set +e
+  git -C "$repo" ls-remote --exit-code --heads origin "$target_branch" >"$check_log" 2>&1
+  check_exit=$?
+  set -e
+
+  if [[ "$check_exit" -eq 0 ]]; then
+    return 0
+  fi
+
+  if [[ "$check_exit" -eq 2 ]]; then
+    return 2
+  fi
+
+  fail "${safe_name}_branch_check_failed" 14 "这次没法确认当前分支是否可部署。" "$(best_error_line "$check_log")"
+}
+
+ensure_repo_on_branch() {
+  local repo="$1"
+  local label="$2"
+  local current
+
+  current="$(current_branch "$repo" || true)"
+  if [[ "$current" == "$target_branch" ]]; then
+    return 0
+  fi
+
+  if git -C "$repo" show-ref --verify --quiet "refs/heads/${target_branch}"; then
+    git -C "$repo" checkout "$target_branch" >/dev/null
+    return 0
+  fi
+
+  if ! git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/${target_branch}"; then
+    fetch_repo_branch "$repo" "$label"
+  fi
+
+  if git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/${target_branch}"; then
+    git -C "$repo" checkout -B "$target_branch" "origin/${target_branch}" >/dev/null
+    return 0
+  fi
+
+  fail "${label}_branch_missing" 14 "这次没法继续，${label} 缺少目标分支。" "${label} 本地和 origin 都没有分支：${target_branch}"
+}
+
+ensure_git_identity() {
+  local user_name
+  local user_email
+
+  user_name="$(git -C "$main_repo" config user.name || true)"
+  user_email="$(git -C "$main_repo" config user.email || true)"
+  if [[ -z "$user_name" || -z "$user_email" ]]; then
+    fail "git_identity_missing" 15 "这次没法自动提交，Git 身份没配置。" "请先配置 user.name 和 user.email。"
+  fi
+
+  echo "GIT_USER_NAME=${user_name}"
+  echo "GIT_USER_EMAIL=${user_email}"
+}
+
+push_branch() {
+  local repo="$1"
+  local label="$2"
+  local log_file
+
+  log_file="/tmp/qq-3ms-intent.${label}.push.log"
+  if ! git -C "$repo" push origin "$target_branch" >"$log_file" 2>&1; then
+    fail "${label}_push_failed" 16 "这次没法继续，${label} push 失败。" "$(best_error_line "$log_file")"
+  fi
+}
+
+commit_and_push_child() {
+  local repo="$1"
+  local label="$2"
+  local key="$3"
+  local add_log
+  local commit_log
+
+  if [[ -z "$(repo_status "$repo")" ]]; then
+    unchanged_children+=("$label")
+    return 0
+  fi
+
+  add_log="/tmp/qq-3ms-intent.${key}.add.log"
+  commit_log="/tmp/qq-3ms-intent.${key}.commit.log"
+
+  if ! git -C "$repo" add -A >"$add_log" 2>&1; then
+    fail "${key}_add_failed" 17 "这次没法继续，${label} 暂存改动失败。" "$(best_error_line "$add_log")"
+  fi
+  if ! git -C "$repo" commit -m "chore: sync from sub2api-main ${declared_main_sha}" >"$commit_log" 2>&1; then
+    fail "${key}_commit_failed" 18 "这次没法继续，${label} commit 失败。" "$(best_error_line "$commit_log")"
+  fi
+
+  push_branch "$repo" "$key"
+  pushed_repos+=("$label")
+}
+
+run_sync_children() {
+  local sync_log
+
+  ensure_repo_on_branch "$backend_repo" "3ms_backend"
+  ensure_repo_on_branch "$frontend_repo" "3ms_frontend"
+  discard_repo_changes "3ms_backend" "$backend_repo"
+  discard_repo_changes "3ms_frontend" "$frontend_repo"
+
+  if [[ ! -x "$sync_backend_script" || ! -x "$sync_frontend_script" ]]; then
+    fail "sync_script_missing" 19 "这次没法继续，子项目同步脚本不存在。"
+  fi
+
+  sync_log="/tmp/qq-3ms-intent.sync.log"
+  : >"$sync_log"
+  if ! "$sync_backend_script" >>"$sync_log" 2>&1; then
+    fail "backend_sync_failed" 20 "这次没法继续，后端同步失败。" "$(best_error_line "$sync_log")"
+  fi
+  if ! "$sync_frontend_script" >>"$sync_log" 2>&1; then
+    fail "frontend_sync_failed" 21 "这次没法继续，前端同步失败。" "$(best_error_line "$sync_log")"
+  fi
+
+  if [[ -n "$(repo_status "$backend_repo")" ]]; then
+    changed_children+=("3ms_backend")
+  else
+    unchanged_children+=("3ms_backend")
+  fi
+
+  if [[ -n "$(repo_status "$frontend_repo")" ]]; then
+    changed_children+=("3ms_frontend")
+  else
+    unchanged_children+=("3ms_frontend")
+  fi
+}
+
+run_merge_upstream() {
+  local fetch_log
+  local merge_log
+  local conflict_count
+  local conflict_preview
+
+  ensure_upstream_remote
+  discard_repo_changes "sub2api-main" "$main_repo"
+
+  fetch_log="/tmp/qq-3ms-intent.fetch-upstream.log"
+  if ! git -C "$main_repo" fetch upstream --prune >"$fetch_log" 2>&1; then
+    fail "fetch_upstream_failed" 22 "这次没法继续，主仓库拉取 upstream 失败。" "$(best_error_line "$fetch_log")"
+  fi
+
+  main_before="$(git -C "$main_repo" rev-parse --short HEAD)"
+  merge_log="/tmp/qq-3ms-intent.merge.log"
+  set +e
+  git -C "$main_repo" merge --no-ff --no-edit upstream/main >"$merge_log" 2>&1
+  merge_exit=$?
+  set -e
+
+  if [[ "$merge_exit" -ne 0 ]]; then
+    conflict_count="$(git -C "$main_repo" diff --name-only --diff-filter=U | sed '/^$/d' | wc -l | tr -d ' ')"
+    if [[ "$conflict_count" != "0" ]]; then
+      conflict_preview="$(git -C "$main_repo" diff --name-only --diff-filter=U | sed -n '1,5p' | paste -sd '、' -)"
+      git -C "$main_repo" merge --abort >/dev/null 2>&1 || true
+      if [[ "$conflict_count" -gt 5 ]]; then
+        conflict_preview="${conflict_preview} 等 ${conflict_count} 个文件"
+      fi
+      fail "merge_conflict" 23 "这次更新失败，主仓库 merge 出现冲突。" "冲突已中止，文件：${conflict_preview}"
+    fi
+
+    fail "merge_failed" 24 "这次更新失败，主仓库 merge 失败。" "$(best_error_line "$merge_log")"
+  fi
+
+  main_after="$(git -C "$main_repo" rev-parse --short HEAD)"
+  declared_main_sha="${main_after}"
+}
+
+run_pull_main_origin() {
+  local fetch_log
+  local pull_log
+  local conflict_count
+  local conflict_preview
+  local pull_exit
+
+  ensure_origin_remote "$main_repo" "sub2api-main"
+  discard_repo_changes "sub2api-main" "$main_repo"
+
+  pull_before="$(git -C "$main_repo" rev-parse --short HEAD)"
+  fetch_log="/tmp/qq-3ms-intent.fetch-origin.log"
+  if ! git -C "$main_repo" fetch origin "refs/heads/${target_branch}:refs/remotes/origin/${target_branch}" >"$fetch_log" 2>&1; then
+    fail "fetch_origin_failed" 25 "这次没法继续，主仓库拉取 origin 失败。" "$(best_error_line "$fetch_log")"
+  fi
+
+  read -r pull_behind_count pull_ahead_count < <(
+    git -C "$main_repo" rev-list --left-right --count "origin/${target_branch}...HEAD"
+  )
+
+  if [[ "$pull_behind_count" -eq 0 ]]; then
+    pull_after="${pull_before}"
+    declared_main_sha="${pull_after}"
+    return 0
+  fi
+
+  pull_log="/tmp/qq-3ms-intent.pull-origin.log"
+  set +e
+  git -C "$main_repo" pull --no-rebase --no-edit origin "$target_branch" >"$pull_log" 2>&1
+  pull_exit=$?
+  set -e
+
+  if [[ "$pull_exit" -ne 0 ]]; then
+    conflict_count="$(git -C "$main_repo" diff --name-only --diff-filter=U | sed '/^$/d' | wc -l | tr -d ' ')"
+    if [[ "$conflict_count" != "0" ]]; then
+      conflict_preview="$(git -C "$main_repo" diff --name-only --diff-filter=U | sed -n '1,5p' | paste -sd '、' -)"
+      git -C "$main_repo" merge --abort >/dev/null 2>&1 || true
+      if [[ "$conflict_count" -gt 5 ]]; then
+        conflict_preview="${conflict_preview} 等 ${conflict_count} 个文件"
+      fi
+      fail "origin_merge_conflict" 26 "这次没法继续，主仓库 git pull origin 出现冲突。" "冲突已中止，文件：${conflict_preview}"
+    fi
+
+    fail "pull_origin_failed" 27 "这次没法继续，主仓库 git pull origin 失败。" "$(best_error_line "$pull_log")"
+  fi
+
+  pull_after="$(git -C "$main_repo" rev-parse --short HEAD)"
+  declared_main_sha="${pull_after}"
+}
+
+handle_check_upstream_status() {
+  local status_log
+  local fetch_status
+  local upstream_main_exists
+  local behind
+  local today_count
+
+  status_log="/tmp/qq-3ms-intent.upstream-status.log"
+  set +e
+  "$upstream_status_script" >"$status_log" 2>&1
+  status_exit=$?
+  set -e
+
+  fetch_status="$(kv_value "FETCH_STATUS" "$status_log")"
+  upstream_main_exists="$(kv_value "UPSTREAM_MAIN_EXISTS" "$status_log")"
+  behind="$(kv_value "BEHIND" "$status_log")"
+  today_count="$(kv_value "UPSTREAM_TODAY_COUNT" "$status_log")"
+
+  echo "INTENT=${intent}"
+  cat "$status_log"
+
+  if [[ "$status_exit" -ne 0 && "$upstream_main_exists" != "1" ]]; then
+    fail "upstream_status_failed" 26 "这次没法确认上游状态。" "$(best_error_line "$status_log")"
+  fi
+
+  if [[ "$fetch_status" == "failed" && "$upstream_main_exists" == "1" ]]; then
+    echo "QQ_RESULT=没法确认上游最新状态。"
+    echo "QQ_DETAIL=fetch upstream 失败；当前本地已知落后 ${behind:-?} 个提交。"
+    return 0
+  fi
+
+  if [[ "${today_count:-0}" -gt 0 ]]; then
+    echo "QQ_RESULT=今天上游 main 有新提交。"
+  else
+    echo "QQ_RESULT=今天上游 main 没新提交。"
+  fi
+  echo "QQ_DETAIL=当前落后 ${behind:-0} 个提交。"
+}
+
+handle_check_main_branch() {
+  local main_branch
+
+  main_branch="$(display_branch "$main_repo")" || fail "main_branch_unknown" 28 "这次没法确认主项目分支。" "sub2api-main 当前不是本地分支。"
+
+  echo "INTENT=${intent}"
+  echo "SUB2API_BRANCH=${main_branch}"
+  echo "QQ_RESULT=主项目当前分支是 ${main_branch}。"
+  echo "QQ_DETAIL=子项目默认跟随主项目分支。"
+}
+
+handle_check_deploy_readiness() {
+  local backend_remote_ok="0"
+  local frontend_remote_ok="0"
+  detail_parts=()
+
+  load_deploy_config_for_check
+  ensure_main_branch
+
+  echo "INTENT=${intent}"
+  echo "SUB2API_BRANCH=${target_branch}"
+
+  if bool_true "${YUNXIAO_BACKEND_ENABLED:-0}"; then
+    if [[ -z "${YUNXIAO_BACKEND_PIPELINE_ID:-}" ]]; then
+      detail_parts+=("3ms_backend pipelineId 未配置")
+    elif ! bool_true "${YUNXIAO_BACKEND_USE_CURRENT_BRANCH:-0}"; then
+      detail_parts+=("3ms_backend 未开启按当前分支部署")
+    fi
+  else
+    detail_parts+=("3ms_backend 云效目标未启用")
+  fi
+
+  if bool_true "${YUNXIAO_FRONTEND_ENABLED:-0}"; then
+    if [[ -z "${YUNXIAO_FRONTEND_PIPELINE_ID:-}" ]]; then
+      detail_parts+=("3ms_frontend pipelineId 未配置")
+    elif ! bool_true "${YUNXIAO_FRONTEND_USE_CURRENT_BRANCH:-0}"; then
+      detail_parts+=("3ms_frontend 未开启按当前分支部署")
+    fi
+  else
+    detail_parts+=("3ms_frontend 云效目标未启用")
+  fi
+
+  if check_repo_branch_on_origin "$backend_repo" "3ms_backend"; then
+    backend_remote_ok="1"
+  else
+    detail_parts+=("3ms_backend 远端缺少 origin/${target_branch}")
+  fi
+
+  if check_repo_branch_on_origin "$frontend_repo" "3ms_frontend"; then
+    frontend_remote_ok="1"
+  else
+    detail_parts+=("3ms_frontend 远端缺少 origin/${target_branch}")
+  fi
+
+  echo "BACKEND_REMOTE_BRANCH=${backend_remote_ok}"
+  echo "FRONTEND_REMOTE_BRANCH=${frontend_remote_ok}"
+
+  if [[ "${#detail_parts[@]}" -eq 0 ]]; then
+    echo "QQ_RESULT=当前分支 ${target_branch} 可以直接触发云效部署。"
+    echo "QQ_DETAIL=3ms_backend、3ms_frontend 远端已存在同名分支；云效已配置按当前分支部署。"
+    return 0
+  fi
+
+  echo "QQ_RESULT=当前分支 ${target_branch} 暂时不能直接触发云效部署。"
+  echo "QQ_DETAIL=$(join_by '；' "${detail_parts[@]}")。"
+}
+
+handle_list_main_branches() {
+  local current_branch
+  local local_branches
+  local origin_branches
+
+  current_branch="$(display_branch "$main_repo")" || fail "main_branch_unknown" 31 "这次没法列出主项目分支。" "sub2api-main 当前不是本地分支。"
+  local_branches="$(branch_line "$main_repo" "refs/heads" "")"
+  origin_branches="$(branch_line "$main_repo" "refs/remotes/origin" "origin/")"
+
+  echo "INTENT=${intent}"
+  echo "SUB2API_BRANCH=${current_branch}"
+  echo "QQ_RESULT=主项目当前分支是 ${current_branch}。"
+  echo "QQ_DETAIL=本地：${local_branches}；origin：${origin_branches}。"
+}
+
+handle_list_command_summary() {
+  local detail_index="1"
+  local command
+
+  echo "INTENT=${intent}"
+  echo "QQ_RESULT=公开主口令 ${#public_commands[@]} 条。"
+  for command in "${public_commands[@]}"; do
+    echo "QQ_DETAIL_${detail_index}=${command}"
+    detail_index=$((detail_index + 1))
+  done
+  echo "QQ_DETAIL_${detail_index}=完整列表发：列出所有口令"
+}
+
+handle_list_fixed_commands() {
+  echo "INTENT=${intent}"
+  echo "QQ_RESULT=当前固定口令共 ${#fixed_commands[@]} 条。"
+  echo "QQ_DETAIL_1=动作口令：看上游更新 / 同步更新 / 拉取上游仓库并部署 / 拉取主项目 / 拉取主项目并部署"
+  echo "QQ_DETAIL_2=动作口令：看分支 / 列分支 / 切分支 <branch> / 部署前检查 / 执行部署"
+  echo "QQ_DETAIL_3=帮助口令：口令 / 列出所有口令"
+  echo "QQ_DETAIL_4=历史长句已下线，只做候选建议，不再直接执行。"
+}
+
+handle_switch_workspace_branch() {
+  discard_repo_changes "sub2api-main" "$main_repo"
+  discard_repo_changes "3ms_backend" "$backend_repo"
+  discard_repo_changes "3ms_frontend" "$frontend_repo"
+
+  ensure_repo_on_branch "$main_repo" "sub2api-main"
+  ensure_repo_on_branch "$backend_repo" "3ms_backend"
+  ensure_repo_on_branch "$frontend_repo" "3ms_frontend"
+
+  echo "INTENT=${intent}"
+  echo "SUB2API_BRANCH=${target_branch}"
+  echo "BACKEND_BRANCH=${target_branch}"
+  echo "FRONTEND_BRANCH=${target_branch}"
+  echo "QQ_RESULT=三个项目已切换到分支 ${target_branch}。"
+
+  detail_parts=("sub2api-main、3ms_backend、3ms_frontend：${target_branch}")
+  if [[ "${#fetched_repos[@]}" -gt 0 ]]; then
+    detail_parts+=("已从 origin 拉取缺失分支：$(join_by '、' "${fetched_repos[@]}")")
+  fi
+  if [[ "${#discarded_repos[@]}" -gt 0 ]]; then
+    detail_parts+=("已丢弃本地改动：$(join_by '、' "${discarded_repos[@]}")")
+  fi
+  echo "QQ_DETAIL=$(join_by '；' "${detail_parts[@]}")。"
+}
+
+handle_update_all() {
+  local update_log
+
+  update_log="/tmp/qq-3ms-intent.update-all.log"
+  set +e
+  "$update_all_script" >"$update_log" 2>&1
+  update_exit=$?
+  set -e
+
+  echo "INTENT=${intent}"
+  cat "$update_log"
+  exit "$update_exit"
+}
+
+handle_deploy_yunxiao() {
+  local deploy_log
+
+  deploy_log="/tmp/qq-3ms-intent.deploy-yunxiao.log"
+  set +e
+  QQ_YUNXIAO_BRANCH="$target_branch" "$deploy_yunxiao_script" >"$deploy_log" 2>&1
+  deploy_exit=$?
+  set -e
+
+  echo "INTENT=${intent}"
+  cat "$deploy_log"
+  exit "$deploy_exit"
+}
+
+handle_update_all_deploy_yunxiao() {
+  local update_log
+  local update_exit
+  local update_result
+  local update_qq_result
+  local update_qq_detail
+  local backend_changed
+  local frontend_changed
+  local deploy_target_arg=""
+  local deploy_log
+  local deploy_exit
+  local deploy_qq_result
+  local deploy_qq_detail
+  local clean_update_detail
+  local clean_deploy_detail
+  detail_parts=()
+
+  load_progress_notify_target
+
+  update_log="/tmp/qq-3ms-intent.update-all-deploy.update.log"
+  set +e
+  QQ_PROGRESS_NOTIFY_TO="$progress_notify_to" "$update_all_script" >"$update_log" 2>&1
+  update_exit=$?
+  set -e
+
+  update_result="$(kv_value "RESULT" "$update_log")"
+  update_qq_result="$(kv_value "QQ_RESULT" "$update_log")"
+  update_qq_detail="$(kv_value "QQ_DETAIL" "$update_log")"
+  backend_changed="$(kv_value "BACKEND_CHANGED" "$update_log")"
+  frontend_changed="$(kv_value "FRONTEND_CHANGED" "$update_log")"
+
+  if [[ "$update_exit" -ne 0 ]]; then
+    echo "INTENT=${intent}"
+    cat "$update_log"
+    exit "$update_exit"
+  fi
+
+  if [[ "$update_result" != "updated" ]]; then
+    echo "INTENT=${intent}"
+    cat "$update_log"
+    exit 0
+  fi
+
+  if [[ "$backend_changed" == "1" && "$frontend_changed" == "1" ]]; then
+    deploy_target_arg="all"
+  elif [[ "$backend_changed" == "1" ]]; then
+    deploy_target_arg="backend"
+  elif [[ "$frontend_changed" == "1" ]]; then
+    deploy_target_arg="frontend"
+  fi
+
+  clean_update_detail="$(strip_update_not_deployed "$update_qq_detail")"
+
+  if [[ -z "$deploy_target_arg" ]]; then
+    echo "INTENT=${intent}"
+    echo "QQ_RESULT=${update_qq_result:-已更新并推送完成。}"
+    if [[ -n "$clean_update_detail" ]]; then
+      echo "QQ_DETAIL=${clean_update_detail}；两个子项目都无同步改动，未触发部署。"
+    else
+      echo "QQ_DETAIL=两个子项目都无同步改动，未触发部署。"
+    fi
+    return 0
+  fi
+
+  deploy_log="/tmp/qq-3ms-intent.update-all-deploy.deploy.log"
+  set +e
+  QQ_YUNXIAO_BRANCH="$target_branch" "$deploy_yunxiao_script" "$deploy_target_arg" >"$deploy_log" 2>&1
+  deploy_exit=$?
+  set -e
+
+  deploy_qq_result="$(kv_value "QQ_RESULT" "$deploy_log")"
+  deploy_qq_detail="$(kv_value "QQ_DETAIL" "$deploy_log")"
+  clean_deploy_detail="$(trim_sentence "$deploy_qq_detail")"
+
+  echo "INTENT=${intent}"
+  echo "DEPLOY_BRANCH=${target_branch}"
+  echo "DEPLOY_TARGETS=${deploy_target_arg}"
+
+  if [[ "$deploy_exit" -eq 0 ]]; then
+    echo "QQ_RESULT=已更新并推送，并已触发云效部署。"
+    if [[ -n "$clean_update_detail" ]]; then
+      detail_parts+=("$clean_update_detail")
+    fi
+    if [[ -n "$clean_deploy_detail" ]]; then
+      detail_parts+=("$clean_deploy_detail")
+    fi
+    if [[ "${#detail_parts[@]}" -gt 0 ]]; then
+      echo "QQ_DETAIL=$(join_by '；' "${detail_parts[@]}")。"
+    fi
+    exit 0
+  fi
+
+  echo "QQ_RESULT=代码已更新并推送，但云效部署失败。"
+  if [[ -n "$clean_update_detail" ]]; then
+    detail_parts+=("$clean_update_detail")
+  fi
+  if [[ -n "$deploy_qq_result" ]]; then
+    detail_parts+=("$(trim_sentence "$deploy_qq_result")")
+  fi
+  if [[ -n "$clean_deploy_detail" ]]; then
+    detail_parts+=("$clean_deploy_detail")
+  fi
+  if [[ "${#detail_parts[@]}" -gt 0 ]]; then
+    echo "QQ_DETAIL=$(join_by '；' "${detail_parts[@]}")。"
+  fi
+  echo "ERROR=deploy_failed_after_update"
+  exit "$deploy_exit"
+}
+
+handle_merge_upstream_main() {
+  run_merge_upstream
+
+  echo "INTENT=${intent}"
+  echo "MAIN_BEFORE=${main_before}"
+  echo "MAIN_AFTER=${main_after}"
+  if [[ "$main_before" == "$main_after" ]]; then
+    echo "QQ_RESULT=主项目已经包含 upstream/main。"
+    if [[ "${#discarded_repos[@]}" -gt 0 ]]; then
+      echo "QQ_DETAIL=已丢弃本地改动：$(join_by '、' "${discarded_repos[@]}")；未 push。"
+    else
+      echo "QQ_DETAIL=未 push。"
+    fi
+  else
+    echo "QQ_RESULT=主项目已合并 upstream/main。"
+    if [[ "${#discarded_repos[@]}" -gt 0 ]]; then
+      echo "QQ_DETAIL=${main_before} -> ${main_after}；已丢弃本地改动：$(join_by '、' "${discarded_repos[@]}")；未 push。"
+    else
+      echo "QQ_DETAIL=${main_before} -> ${main_after}；未 push。"
+    fi
+  fi
+}
+
+handle_merge_upstream_main_push() {
+  run_merge_upstream
+  ensure_origin_remote "$main_repo" "sub2api-main"
+  push_branch "$main_repo" "main"
+
+  echo "INTENT=${intent}"
+  echo "MAIN_BEFORE=${main_before}"
+  echo "MAIN_AFTER=${main_after}"
+  if [[ "$main_before" == "$main_after" ]]; then
+    echo "QQ_RESULT=主项目已是最新，并已推送。"
+  else
+    echo "QQ_RESULT=主项目已合并上游并推送。"
+  fi
+  detail_parts=()
+  detail_parts+=("${main_before} -> ${main_after}")
+  if [[ "${#discarded_repos[@]}" -gt 0 ]]; then
+    detail_parts+=("已丢弃本地改动：$(join_by '、' "${discarded_repos[@]}")")
+  fi
+  echo "QQ_DETAIL=$(join_by '；' "${detail_parts[@]}")。"
+}
+
+handle_sync_children() {
+  run_sync_children
+
+  echo "INTENT=${intent}"
+  if [[ "${#changed_children[@]}" -eq 0 ]]; then
+    echo "QQ_RESULT=子项目已同步完成。"
+    detail_parts=("两个子项目都没有同步差异")
+  else
+    echo "QQ_RESULT=子项目已同步完成。"
+    detail_parts=("有同步改动：$(join_by '、' "${changed_children[@]}")")
+    detail_parts+=("未 commit/push")
+  fi
+  if [[ "${#discarded_repos[@]}" -gt 0 ]]; then
+    detail_parts+=("已丢弃本地改动：$(join_by '、' "${discarded_repos[@]}")")
+  fi
+  echo "QQ_DETAIL=$(join_by '；' "${detail_parts[@]}")。"
+}
+
+handle_sync_children_push() {
+  ensure_git_identity
+  declared_main_sha="$(git -C "$main_repo" rev-parse --short HEAD)"
+  run_sync_children
+  commit_and_push_child "$backend_repo" "3ms_backend" "backend"
+  commit_and_push_child "$frontend_repo" "3ms_frontend" "frontend"
+
+  echo "INTENT=${intent}"
+  if [[ "${#pushed_repos[@]}" -eq 0 ]]; then
+    echo "QQ_RESULT=子项目已同步完成。"
+  else
+    echo "QQ_RESULT=子项目已同步并推送完成。"
+  fi
+  detail_parts=()
+  if [[ "${#pushed_repos[@]}" -gt 0 ]]; then
+    detail_parts+=("已 commit+push：$(join_by '、' "${pushed_repos[@]}")")
+  fi
+  if [[ "${#unchanged_children[@]}" -gt 0 ]]; then
+    detail_parts+=("无同步改动：$(join_by '、' "${unchanged_children[@]}")")
+  fi
+  if [[ "${#discarded_repos[@]}" -gt 0 ]]; then
+    detail_parts+=("已丢弃本地改动：$(join_by '、' "${discarded_repos[@]}")")
+  fi
+  echo "QQ_DETAIL=$(join_by '；' "${detail_parts[@]}")。"
+}
+
+handle_pull_main_origin() {
+  run_pull_main_origin
+
+  echo "INTENT=${intent}"
+  echo "MAIN_BEFORE=${pull_before}"
+  echo "MAIN_AFTER=${pull_after}"
+  if [[ "$pull_ahead_count" -gt 0 && "$pull_behind_count" -eq 0 ]]; then
+    echo "QQ_RESULT=主项目本地已领先 $(origin_branch_label)。"
+  elif [[ "$pull_before" == "$pull_after" ]]; then
+    echo "QQ_RESULT=主项目已经和 $(origin_branch_label) 同步。"
+  else
+    echo "QQ_RESULT=主项目已拉取 $(origin_branch_label) 最新代码。"
+  fi
+  detail_parts=("${pull_before} -> ${pull_after}")
+  if [[ "$pull_ahead_count" -gt 0 && "$pull_behind_count" -eq 0 ]]; then
+    detail_parts+=("本地领先 ${pull_ahead_count} 个提交")
+  fi
+  if [[ "${#discarded_repos[@]}" -gt 0 ]]; then
+    detail_parts+=("已丢弃本地改动：$(join_by '、' "${discarded_repos[@]}")")
+  fi
+  echo "QQ_DETAIL=$(join_by '；' "${detail_parts[@]}")。"
+}
+
+handle_pull_main_origin_sync_children_push() {
+  ensure_git_identity
+  run_pull_main_origin
+  run_sync_children
+  commit_and_push_child "$backend_repo" "3ms_backend" "backend"
+  commit_and_push_child "$frontend_repo" "3ms_frontend" "frontend"
+
+  echo "INTENT=${intent}"
+  if [[ "$pull_ahead_count" -gt 0 && "$pull_behind_count" -eq 0 ]]; then
+    if [[ "${#pushed_repos[@]}" -eq 0 ]]; then
+      echo "QQ_RESULT=主项目本地已领先 $(origin_branch_label)，子项目已完成同步。"
+    else
+      echo "QQ_RESULT=主项目本地已领先 $(origin_branch_label)，子项目已同步并推送完成。"
+    fi
+  elif [[ "${#pushed_repos[@]}" -eq 0 ]]; then
+    echo "QQ_RESULT=主项目已拉取 $(origin_branch_label)，子项目已完成同步。"
+  else
+    echo "QQ_RESULT=主项目已拉取 $(origin_branch_label)，子项目已同步并推送完成。"
+  fi
+  detail_parts=("${pull_before} -> ${pull_after}")
+  if [[ "$pull_ahead_count" -gt 0 && "$pull_behind_count" -eq 0 ]]; then
+    detail_parts+=("本地领先 ${pull_ahead_count} 个提交")
+  fi
+  if [[ "${#pushed_repos[@]}" -gt 0 ]]; then
+    detail_parts+=("已 commit+push：$(join_by '、' "${pushed_repos[@]}")")
+  fi
+  if [[ "${#unchanged_children[@]}" -gt 0 ]]; then
+    detail_parts+=("无同步改动：$(join_by '、' "${unchanged_children[@]}")")
+  fi
+  if [[ "${#discarded_repos[@]}" -gt 0 ]]; then
+    detail_parts+=("已丢弃本地改动：$(join_by '、' "${discarded_repos[@]}")")
+  fi
+  echo "QQ_DETAIL=$(join_by '；' "${detail_parts[@]}")。"
+}
+
+handle_pull_main_origin_sync_children_push_deploy_yunxiao() {
+  local pushed_backend="0"
+  local pushed_frontend="0"
+  local deploy_target_arg=""
+  local pushed_repo
+  local deploy_log
+  local deploy_exit
+  local deploy_qq_result
+  local deploy_qq_detail
+  local clean_deploy_detail
+
+  load_progress_notify_target
+  ensure_git_identity
+  run_pull_main_origin
+  if [[ "$pull_ahead_count" -gt 0 && "$pull_behind_count" -eq 0 ]]; then
+    send_progress_notify "主项目本地已领先 $(origin_branch_label)。"
+  elif [[ "$pull_before" == "$pull_after" ]]; then
+    send_progress_notify "主项目已经和 $(origin_branch_label) 同步。"
+  else
+    send_progress_notify "主项目已拉取 $(origin_branch_label) 最新代码。${pull_before} -> ${pull_after}。"
+  fi
+  run_sync_children
+  commit_and_push_child "$backend_repo" "3ms_backend" "backend"
+  commit_and_push_child "$frontend_repo" "3ms_frontend" "frontend"
+
+  for pushed_repo in "${pushed_repos[@]}"; do
+    case "$pushed_repo" in
+      3ms_backend)
+        pushed_backend="1"
+        ;;
+      3ms_frontend)
+        pushed_frontend="1"
+        ;;
+    esac
+  done
+
+  if [[ "$pushed_backend" == "1" && "$pushed_frontend" == "1" ]]; then
+    deploy_target_arg="all"
+  elif [[ "$pushed_backend" == "1" ]]; then
+    deploy_target_arg="backend"
+  elif [[ "$pushed_frontend" == "1" ]]; then
+    deploy_target_arg="frontend"
+  fi
+
+  echo "INTENT=${intent}"
+
+  detail_parts=("${pull_before} -> ${pull_after}")
+  if [[ "$pull_ahead_count" -gt 0 && "$pull_behind_count" -eq 0 ]]; then
+    detail_parts+=("本地领先 ${pull_ahead_count} 个提交")
+  fi
+  if [[ "${#pushed_repos[@]}" -gt 0 ]]; then
+    detail_parts+=("已 commit+push：$(join_by '、' "${pushed_repos[@]}")")
+  fi
+  if [[ "${#unchanged_children[@]}" -gt 0 ]]; then
+    detail_parts+=("无同步改动：$(join_by '、' "${unchanged_children[@]}")")
+  fi
+  if [[ "${#discarded_repos[@]}" -gt 0 ]]; then
+    detail_parts+=("已丢弃本地改动：$(join_by '、' "${discarded_repos[@]}")")
+  fi
+
+child_stage_parts=()
+if [[ "${#pushed_repos[@]}" -gt 0 ]]; then
+  child_stage_parts+=("已 commit+push：$(join_by '、' "${pushed_repos[@]}")")
+fi
+if [[ "${#unchanged_children[@]}" -gt 0 ]]; then
+  child_stage_parts+=("无同步改动：$(join_by '、' "${unchanged_children[@]}")")
+fi
+if [[ "${#pushed_repos[@]}" -eq 0 ]]; then
+  if [[ "${#child_stage_parts[@]}" -eq 0 ]]; then
+    send_progress_notify "子项目已完成同步。两个子项目都无同步改动。"
+  else
+    send_progress_notify "子项目已完成同步。$(join_by '；' "${child_stage_parts[@]}")。"
+  fi
+else
+  send_progress_notify "子项目已同步并推送完成。$(join_by '；' "${child_stage_parts[@]}")。"
+fi
+
+  if [[ -z "$deploy_target_arg" ]]; then
+    if [[ "$pull_ahead_count" -gt 0 && "$pull_behind_count" -eq 0 ]]; then
+      echo "QQ_RESULT=主项目本地已领先 $(origin_branch_label)，子项目已完成同步。"
+    else
+      echo "QQ_RESULT=主项目已拉取 $(origin_branch_label)，子项目已完成同步。"
+    fi
+    detail_parts+=("两个子项目都无同步改动，未触发部署")
+    echo "QQ_DETAIL=$(join_by '；' "${detail_parts[@]}")。"
+    return 0
+  fi
+
+  deploy_log="/tmp/qq-3ms-intent.pull-origin-deploy.deploy.log"
+  set +e
+  QQ_YUNXIAO_BRANCH="$target_branch" "$deploy_yunxiao_script" "$deploy_target_arg" >"$deploy_log" 2>&1
+  deploy_exit=$?
+  set -e
+
+  deploy_qq_result="$(kv_value "QQ_RESULT" "$deploy_log")"
+  deploy_qq_detail="$(kv_value "QQ_DETAIL" "$deploy_log")"
+  clean_deploy_detail="$(trim_sentence "$deploy_qq_detail")"
+
+  echo "DEPLOY_BRANCH=${target_branch}"
+  echo "DEPLOY_TARGETS=${deploy_target_arg}"
+
+  if [[ "$deploy_exit" -eq 0 ]]; then
+    if [[ "$pull_ahead_count" -gt 0 && "$pull_behind_count" -eq 0 ]]; then
+      echo "QQ_RESULT=主项目本地已领先 $(origin_branch_label)，子项目已同步并推送，并已触发云效部署。"
+    else
+      echo "QQ_RESULT=主项目已拉取 $(origin_branch_label)，子项目已同步并推送，并已触发云效部署。"
+    fi
+    if [[ -n "$clean_deploy_detail" ]]; then
+      detail_parts+=("$clean_deploy_detail")
+    fi
+    echo "QQ_DETAIL=$(join_by '；' "${detail_parts[@]}")。"
+    exit 0
+  fi
+
+  echo "QQ_RESULT=代码已更新并推送，但云效部署失败。"
+  if [[ -n "$deploy_qq_result" ]]; then
+    detail_parts+=("$(trim_sentence "$deploy_qq_result")")
+  fi
+  if [[ -n "$clean_deploy_detail" ]]; then
+    detail_parts+=("$clean_deploy_detail")
+  fi
+  echo "QQ_DETAIL=$(join_by '；' "${detail_parts[@]}")。"
+  echo "ERROR=deploy_failed_after_pull_sync"
+  exit "$deploy_exit"
+}
+
+if [[ -z "$intent_arg" || "$intent_arg" == "-h" || "$intent_arg" == "--help" || "$intent_arg" == "help" ]]; then
+  usage
+  exit 0
+fi
+
+intent="$(normalize_intent "$intent_arg")" || {
+  usage >&2
+  exit 1
+}
+
+echo "WORKSPACE=${workspace}"
+echo "MAIN_REPO=${main_repo}"
+
+case "$intent" in
+  check-upstream-status)
+    handle_check_upstream_status
+    ;;
+  check-main-branch)
+    handle_check_main_branch
+    ;;
+  switch-workspace-branch)
+    ensure_requested_branch
+    handle_switch_workspace_branch
+    ;;
+  check-deploy-readiness)
+    handle_check_deploy_readiness
+    ;;
+  list-main-branches)
+    handle_list_main_branches
+    ;;
+  list-command-summary)
+    handle_list_command_summary
+    ;;
+  list-fixed-commands)
+    handle_list_fixed_commands
+    ;;
+  merge-upstream-main)
+    ensure_main_branch
+    handle_merge_upstream_main
+    ;;
+  sync-children)
+    ensure_main_branch
+    handle_sync_children
+    ;;
+  merge-upstream-main-push)
+    ensure_main_branch
+    handle_merge_upstream_main_push
+    ;;
+  sync-children-push)
+    ensure_main_branch
+    handle_sync_children_push
+    ;;
+  update-all)
+    handle_update_all
+    ;;
+  pull-main-origin)
+    ensure_main_branch
+    handle_pull_main_origin
+    ;;
+  pull-main-origin-sync-children-push)
+    ensure_main_branch
+    handle_pull_main_origin_sync_children_push
+    ;;
+  pull-main-origin-sync-children-push-deploy-yunxiao)
+    ensure_main_branch
+    handle_pull_main_origin_sync_children_push_deploy_yunxiao
+    ;;
+  deploy-yunxiao)
+    ensure_main_branch
+    handle_deploy_yunxiao
+    ;;
+  update-all-deploy-yunxiao)
+    ensure_main_branch
+    handle_update_all_deploy_yunxiao
+    ;;
+  *)
+    fail "intent_not_supported" 99 "不支持的 intent。"
+    ;;
+esac

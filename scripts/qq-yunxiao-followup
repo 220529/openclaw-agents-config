@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+openclaw_home="${OPENCLAW_HOME:-${HOME:-/root}/.openclaw}"
+openclaw_workspace="${OPENCLAW_WORKSPACE:-${openclaw_home}/workspace}"
+config_path="${QQ_YUNXIAO_DEPLOY_CONFIG:-${openclaw_home}/qq-yunxiao-deploy.conf}"
+notify_to="${1:-}"
+timeout_sec="${2:-1800}"
+poll_interval_sec="${3:-15}"
+
+if [[ -z "$notify_to" || "$#" -lt 4 ]]; then
+  exit 1
+fi
+
+shift 3
+targets=("$@")
+
+if [[ ! -f "$config_path" ]]; then
+  exit 1
+fi
+
+# shellcheck disable=SC1090
+. "$config_path"
+
+edition="${YUNXIAO_API_EDITION:-center}"
+domain="${YUNXIAO_API_DOMAIN:-openapi-rdc.aliyuncs.com}"
+organization_id="${YUNXIAO_ORGANIZATION_ID:-}"
+token_file="${YUNXIAO_API_TOKEN_FILE:-}"
+api_token="${YUNXIAO_API_TOKEN:-}"
+
+if [[ -z "$api_token" ]]; then
+  if [[ -z "$token_file" || ! -r "$token_file" ]]; then
+    exit 1
+  fi
+  api_token="$(sed -n '/[^[:space:]]/ { s/^[[:space:]]*//; s/[[:space:]]*$//; p; q; }' "$token_file")"
+fi
+
+if [[ -z "$api_token" ]]; then
+  exit 1
+fi
+
+api_base_prefix() {
+  if [[ "$edition" == "center" ]]; then
+    printf 'https://%s/oapi/v1/flow/organizations/%s' "$domain" "$organization_id"
+  else
+    printf 'https://%s/oapi/v1/flow' "$domain"
+  fi
+}
+
+pipeline_run_url() {
+  local pipeline_id="$1"
+  local run_id="$2"
+  printf '%s/pipelines/%s/runs/%s' "$(api_base_prefix)" "$pipeline_id" "$run_id"
+}
+
+is_terminal_status() {
+  case "${1:-}" in
+    SUCCESS|FAIL|FAILED|ERROR|CANCELED|CANCELLED|ABORTED|STOPPED|PART_SUCCESS)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+status_label() {
+  case "${1:-}" in
+    SUCCESS)
+      printf '成功'
+      ;;
+    FAIL|FAILED|ERROR)
+      printf '失败'
+      ;;
+    CANCELED|CANCELLED|ABORTED|STOPPED)
+      printf '已终止'
+      ;;
+    PART_SUCCESS)
+      printf '部分成功'
+      ;;
+    *)
+      printf '%s' "${1:-UNKNOWN}"
+      ;;
+  esac
+}
+
+fetch_run_json() {
+  local pipeline_id="$1"
+  local run_id="$2"
+  local out_file="$3"
+
+  curl -sS \
+    -H "content-type: application/json" \
+    -H "x-yunxiao-token: ${api_token}" \
+    -o "$out_file" \
+    "$(pipeline_run_url "$pipeline_id" "$run_id")"
+}
+
+summarize_failure_job() {
+  local json_file="$1"
+  python3 - "$json_file" <<'PY'
+import json
+import pathlib
+import sys
+
+data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+
+for stage in data.get("stages") or []:
+    stage_info = stage.get("stageInfo") or {}
+    for job in stage_info.get("jobs") or []:
+        status = (job.get("status") or "").upper()
+        if status and status not in {"SUCCESS", "RUNNING", "WAITING"}:
+            print(job.get("name") or f"job#{job.get('id')}")
+            raise SystemExit(0)
+print("")
+PY
+}
+
+send_notify() {
+  local text="$1"
+  if "${QQBOT_PROACTIVE_SEND_SCRIPT:-${openclaw_workspace}/bin/qqbot-proactive-send}" "$notify_to" "$text"; then
+    echo "notify_sent_to=${notify_to}"
+    return 0
+  fi
+
+  echo "notify_failed_to=${notify_to}" >&2
+  return 1
+}
+
+declare -A target_status=()
+declare -A target_failure_job=()
+
+deadline=$(( $(date +%s) + timeout_sec ))
+
+while :; do
+  done_count=0
+
+  for item in "${targets[@]}"; do
+    IFS='|' read -r label pipeline_id run_id <<<"$item"
+
+    if [[ -n "${target_status[$label]:-}" ]] && is_terminal_status "${target_status[$label]}"; then
+      done_count=$((done_count + 1))
+      continue
+    fi
+
+    json_file="/tmp/qq-yunxiao-followup.${pipeline_id}.${run_id}.json"
+    if ! fetch_run_json "$pipeline_id" "$run_id" "$json_file"; then
+      continue
+    fi
+
+    status="$(python3 - "$json_file" <<'PY'
+import json
+import pathlib
+import sys
+data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(data.get("status") or "")
+PY
+)"
+    target_status["$label"]="$status"
+
+    if is_terminal_status "$status"; then
+      done_count=$((done_count + 1))
+      target_failure_job["$label"]="$(summarize_failure_job "$json_file")"
+    fi
+  done
+
+  if [[ "$done_count" -eq "${#targets[@]}" ]]; then
+    parts=()
+    has_failure=0
+    for item in "${targets[@]}"; do
+      IFS='|' read -r label _ run_id <<<"$item"
+      status="${target_status[$label]:-UNKNOWN}"
+      part="${label}：$(status_label "$status")（#${run_id}）"
+      if [[ -n "${target_failure_job[$label]:-}" ]]; then
+        part="${part}，失败任务：${target_failure_job[$label]}"
+      fi
+      parts+=("$part")
+      case "$status" in
+        SUCCESS) ;;
+        *) has_failure=1 ;;
+      esac
+    done
+
+    if [[ "$has_failure" -eq 0 ]]; then
+      send_notify "云效部署完成。$(IFS='；'; echo "${parts[*]}")。"
+    else
+      send_notify "云效部署已结束。$(IFS='；'; echo "${parts[*]}")。"
+    fi
+    exit 0
+  fi
+
+  if [[ "$(date +%s)" -ge "$deadline" ]]; then
+    parts=()
+    for item in "${targets[@]}"; do
+      IFS='|' read -r label _ run_id <<<"$item"
+      status="${target_status[$label]:-RUNNING}"
+      parts+=("${label}：$(status_label "$status")（#${run_id}）")
+    done
+    send_notify "云效部署状态仍在等待最终结果。$(IFS='；'; echo "${parts[*]}")。"
+    exit 0
+  fi
+
+  sleep "$poll_interval_sec"
+done

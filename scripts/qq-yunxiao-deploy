@@ -1,0 +1,597 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+openclaw_home="${OPENCLAW_HOME:-${HOME:-/root}/.openclaw}"
+openclaw_workspace="${OPENCLAW_WORKSPACE:-${openclaw_home}/workspace}"
+default_config="${openclaw_home}/qq-yunxiao-deploy.conf"
+template_config="${openclaw_workspace}/.openclaw/qq-yunxiao-deploy.conf.example"
+
+config_path="${QQ_YUNXIAO_DEPLOY_CONFIG:-$default_config}"
+requested_target="${1:-all}"
+requested_branch="${QQ_YUNXIAO_BRANCH:-}"
+edition=""
+domain=""
+organization_id=""
+api_token=""
+notify_enabled=""
+notify_to=""
+notify_timeout_sec=""
+notify_poll_interval_sec=""
+
+target_summaries=()
+completed_summaries=()
+created_runs=()
+
+usage() {
+  cat <<'EOF'
+用法:
+  qq-yunxiao-deploy [all|backend|frontend|<target>]
+
+说明:
+  - 默认读取 ${OPENCLAW_HOME:-~/.openclaw}/qq-yunxiao-deploy.conf
+  - 支持的动作:
+    - create_run
+    - pass_validate
+    - execute_job
+EOF
+}
+
+join_by() {
+  local sep="$1"
+  shift
+  local out=""
+  local item
+  for item in "$@"; do
+    if [[ -z "$out" ]]; then
+      out="$item"
+    else
+      out="${out}${sep}${item}"
+    fi
+  done
+  printf '%s' "$out"
+}
+
+first_nonempty_line() {
+  local file="$1"
+  sed -n '/[^[:space:]]/ { p; q; }' "$file"
+}
+
+fail() {
+  local error_code="$1"
+  local exit_code="$2"
+  local result="$3"
+  local detail="${4:-}"
+
+  if [[ -n "$detail" && "${#completed_summaries[@]}" -gt 0 ]]; then
+    detail="${detail}；已完成：$(join_by '；' "${completed_summaries[@]}")"
+  elif [[ -z "$detail" && "${#completed_summaries[@]}" -gt 0 ]]; then
+    detail="已完成：$(join_by '；' "${completed_summaries[@]}")"
+  fi
+
+  echo "QQ_RESULT=${result}"
+  if [[ -n "$detail" ]]; then
+    echo "QQ_DETAIL=${detail}"
+  fi
+  echo "ERROR=${error_code}"
+  exit "$exit_code"
+}
+
+upper_target() {
+  printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_'
+}
+
+cfg_get() {
+  local prefix="$1"
+  local key="$2"
+  local var="YUNXIAO_${prefix}_${key}"
+  printf '%s' "${!var:-}"
+}
+
+bool_true() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+read_token() {
+  local token_file="${YUNXIAO_API_TOKEN_FILE:-}"
+
+  if [[ -n "${YUNXIAO_API_TOKEN:-}" ]]; then
+    api_token="${YUNXIAO_API_TOKEN}"
+    return 0
+  fi
+
+  if [[ -z "$token_file" ]]; then
+    fail "token_missing" 11 "这次没法部署，云效 PAT 还没配。" "请在 ${config_path} 里配置 YUNXIAO_API_TOKEN 或 YUNXIAO_API_TOKEN_FILE。"
+  fi
+
+  if [[ ! -r "$token_file" ]]; then
+    fail "token_file_missing" 12 "这次没法部署，云效 PAT 文件不可读。" "$token_file"
+  fi
+
+  api_token="$(sed -n '/[^[:space:]]/ { s/^[[:space:]]*//; s/[[:space:]]*$//; p; q; }' "$token_file")"
+  if [[ -z "$api_token" ]]; then
+    fail "token_empty" 13 "这次没法部署，云效 PAT 文件是空的。" "$token_file"
+  fi
+}
+
+load_config() {
+  if [[ ! -f "$config_path" ]]; then
+    fail "config_missing" 10 "这次没法部署，云效配置还没接好。" "缺少配置文件：${config_path}；可参考：${template_config}"
+  fi
+
+  # shellcheck disable=SC1090
+  . "$config_path"
+
+  edition="${YUNXIAO_API_EDITION:-center}"
+  domain="${YUNXIAO_API_DOMAIN:-openapi-rdc.aliyuncs.com}"
+  notify_enabled="${YUNXIAO_NOTIFY_ON_FINISH:-0}"
+  notify_to="${YUNXIAO_NOTIFY_TO:-}"
+  notify_timeout_sec="${YUNXIAO_NOTIFY_TIMEOUT_SEC:-1800}"
+  notify_poll_interval_sec="${YUNXIAO_NOTIFY_POLL_INTERVAL_SEC:-15}"
+
+  case "$edition" in
+    center)
+      organization_id="${YUNXIAO_ORGANIZATION_ID:-}"
+      if [[ -z "$organization_id" ]]; then
+        fail "organization_missing" 14 "这次没法部署，云效 organizationId 还没配。" "请在 ${config_path} 里配置 YUNXIAO_ORGANIZATION_ID。"
+      fi
+      ;;
+    region)
+      organization_id=""
+      ;;
+    *)
+      fail "edition_invalid" 15 "这次没法部署，云效 API 版型配置不对。" "YUNXIAO_API_EDITION 只支持 center 或 region。"
+      ;;
+  esac
+
+  read_token
+}
+
+api_base_prefix() {
+  if [[ "$edition" == "center" ]]; then
+    printf 'https://%s/oapi/v1/flow/organizations/%s' "$domain" "$organization_id"
+  else
+    printf 'https://%s/oapi/v1/flow' "$domain"
+  fi
+}
+
+pipeline_base_url() {
+  local pipeline_id="$1"
+  printf '%s/pipelines/%s' "$(api_base_prefix)" "$pipeline_id"
+}
+
+json_error_summary() {
+  local body_file="$1"
+  python3 - "$body_file" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+raw = path.read_text(encoding="utf-8").strip()
+if not raw:
+    print("云效接口返回空响应。")
+    raise SystemExit(0)
+
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError:
+    print(raw.splitlines()[0][:200])
+    raise SystemExit(0)
+
+parts = []
+for key in ("code", "Code", "errorCode", "requestId", "RequestId"):
+    value = data.get(key)
+    if value not in (None, ""):
+        parts.append(f"{key}={value}")
+for key in ("message", "Message", "msg", "errorMessage", "ErrorMessage"):
+    value = data.get(key)
+    if value not in (None, ""):
+        parts.append(str(value))
+        break
+if not parts:
+    parts.append(raw[:200])
+print("；".join(parts))
+PY
+}
+
+json_kv() {
+  local body_file="$1"
+  local action="$2"
+  local job_name="${3:-}"
+  local job_id="${4:-}"
+
+  python3 - "$body_file" "$action" "$job_name" "$job_id" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+action = sys.argv[2]
+job_name = sys.argv[3]
+job_id = sys.argv[4]
+data = json.loads(path.read_text(encoding="utf-8"))
+
+jobs = []
+for stage in data.get("stages") or []:
+    stage_info = stage.get("stageInfo") or {}
+    for job in stage_info.get("jobs") or []:
+        jobs.append({
+            "id": "" if job.get("id") is None else str(job.get("id")),
+            "name": job.get("name") or "",
+            "status": job.get("status") or "",
+            "actions": job.get("actions") or [],
+        })
+
+selected = None
+selected_action = None
+
+if job_id:
+    for job in jobs:
+        if job["id"] == job_id:
+            selected = job
+            break
+elif job_name:
+    for job in jobs:
+        if job["name"] == job_name:
+            selected = job
+            break
+
+def action_match(candidate, target_action):
+    action_type = candidate.get("type") or ""
+    title = " ".join(
+        part for part in (candidate.get("title"), candidate.get("name")) if part
+    )
+    display_type = candidate.get("displayType") or ""
+    if target_action == "pass_validate":
+        return action_type == "PassPipelineValidate" or "人工卡点" in title or "卡点" in title
+    if target_action == "execute_job":
+        return action_type == "ExecutePipelineJobRun" or (
+            display_type != "LOG" and any(word in title for word in ("运行", "执行", "开始"))
+        )
+    return False
+
+if selected is not None:
+    for candidate in selected["actions"]:
+        if candidate.get("disable") is True:
+            continue
+        if action_match(candidate, action):
+            selected_action = candidate
+            break
+
+if selected is None:
+    for job in jobs:
+        for candidate in job["actions"]:
+            if candidate.get("disable") is True:
+                continue
+            if action_match(candidate, action):
+                selected = job
+                selected_action = candidate
+                break
+        if selected is not None:
+            break
+
+available_jobs = "、".join(job["name"] or f"job#{job['id']}" for job in jobs[:8])
+
+print(f"PIPELINE_RUN_ID={'' if data.get('pipelineRunId') is None else data.get('pipelineRunId')}")
+print(f"PIPELINE_RUN_STATUS={data.get('status') or ''}")
+print(f"JOB_ID={selected['id'] if selected else ''}")
+print(f"JOB_NAME={selected['name'] if selected else ''}")
+print(f"JOB_STATUS={selected['status'] if selected else ''}")
+print(f"ACTION_TYPE={selected_action.get('type') if selected_action else ''}")
+print(f"ACTION_DISABLED={selected_action.get('disable') if selected_action is not None else ''}")
+print(f"AVAILABLE_JOBS={available_jobs}")
+PY
+}
+
+kv_value() {
+  local key="$1"
+  local file="$2"
+  sed -n "s/^${key}=//p" "$file" | sed -n '1p'
+}
+
+api_request() {
+  local method="$1"
+  local url="$2"
+  local response_file="$3"
+  local body_file="${4:-}"
+  local http_code=""
+
+  if [[ -n "$body_file" ]]; then
+    if ! http_code="$(curl -sS -X "$method" \
+      -H "content-type: application/json" \
+      -H "x-yunxiao-token: ${api_token}" \
+      --data "@${body_file}" \
+      -o "$response_file" \
+      -w "%{http_code}" \
+      "$url" 2>"${response_file}.curl.err")"; then
+      fail "request_failed" 21 "这次没法部署，云效 API 调用失败。" "$(first_nonempty_line "${response_file}.curl.err")"
+    fi
+  else
+    if ! http_code="$(curl -sS -X "$method" \
+      -H "content-type: application/json" \
+      -H "x-yunxiao-token: ${api_token}" \
+      -o "$response_file" \
+      -w "%{http_code}" \
+      "$url" 2>"${response_file}.curl.err")"; then
+      fail "request_failed" 21 "这次没法部署，云效 API 调用失败。" "$(first_nonempty_line "${response_file}.curl.err")"
+    fi
+  fi
+
+  if [[ ! "$http_code" =~ ^2 ]]; then
+    fail "request_http_${http_code}" 22 "这次没法部署，云效 API 返回异常。" "$(json_error_summary "$response_file")"
+  fi
+}
+
+build_create_run_body() {
+  local prefix="$1"
+  local body_file="$2"
+  local params_json
+  local params_file
+  local use_current_branch
+
+  params_json="$(cfg_get "$prefix" "CREATE_RUN_PARAMS_JSON")"
+  params_file="$(cfg_get "$prefix" "CREATE_RUN_PARAMS_FILE")"
+  use_current_branch="$(cfg_get "$prefix" "USE_CURRENT_BRANCH")"
+
+  if [[ -n "$params_file" && ! -r "$params_file" ]]; then
+    fail "params_file_missing" 23 "这次没法部署，流水线启动参数文件不可读。" "$params_file"
+  fi
+
+  if bool_true "$use_current_branch" && [[ -z "$requested_branch" ]]; then
+    fail "branch_missing" 34 "这次没法部署，当前分支还没传进来。" "请通过 qq-3ms-intent 调用，或先设置 QQ_YUNXIAO_BRANCH。"
+  fi
+
+  python3 - "$body_file" "$params_json" "$params_file" "$use_current_branch" "$requested_branch" <<'PY'
+import json
+import pathlib
+import sys
+
+out_path = pathlib.Path(sys.argv[1])
+params_json = sys.argv[2]
+params_file = sys.argv[3]
+use_current_branch = sys.argv[4].lower() in {"1", "true", "yes", "on"}
+requested_branch = sys.argv[5]
+payload = {}
+params = {}
+
+if params_file:
+    params_json = pathlib.Path(params_file).read_text(encoding="utf-8").strip()
+
+if params_json:
+    loaded = json.loads(params_json)
+    if not isinstance(loaded, dict):
+        raise SystemExit("create_run params must be a JSON object")
+    params = loaded
+
+if use_current_branch:
+    params["branchModeBranchs"] = [requested_branch]
+
+if params:
+    payload["params"] = json.dumps(params, ensure_ascii=False, separators=(",", ":"))
+
+out_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+PY
+}
+
+run_create_pipeline() {
+  local label="$1"
+  local pipeline_id="$2"
+  local prefix="$3"
+  local response_file="/tmp/qq-yunxiao-deploy.${prefix}.create.json"
+  local body_file="/tmp/qq-yunxiao-deploy.${prefix}.create.body.json"
+  local run_id=""
+  local raw=""
+
+  build_create_run_body "$prefix" "$body_file"
+  api_request "POST" "$(pipeline_base_url "$pipeline_id")/runs" "$response_file" "$body_file"
+
+  raw="$(tr -d '[:space:]' <"$response_file")"
+  run_id="${raw#\"}"
+  run_id="${run_id%\"}"
+  if [[ ! "$run_id" =~ ^[0-9]+$ ]]; then
+    fail "create_run_parse_failed" 24 "这次没法部署，启动流水线后的返回结果看不懂。" "$(first_nonempty_line "$response_file")"
+  fi
+
+  completed_summaries+=("${label}：已启动流水线 #${run_id}")
+  target_summaries+=("${label}：已启动流水线 #${run_id}")
+  created_runs+=("${label}|${pipeline_id}|${run_id}")
+}
+
+spawn_finish_notify() {
+  local watcher_script="${openclaw_workspace}/bin/qq-yunxiao-followup"
+  local unit_name
+  local random_suffix
+
+  if ! bool_true "$notify_enabled"; then
+    return 0
+  fi
+  if [[ -z "$notify_to" ]]; then
+    return 0
+  fi
+  if [[ "${#created_runs[@]}" -eq 0 ]]; then
+    return 0
+  fi
+  if [[ ! -x "$watcher_script" ]]; then
+    return 0
+  fi
+
+  random_suffix="$(date +%s)-$$-$RANDOM"
+  unit_name="qq-yunxiao-followup-${random_suffix}"
+
+  if command -v systemd-run >/dev/null 2>&1; then
+    systemd-run --user --unit "$unit_name" --collect \
+      "$watcher_script" \
+      "$notify_to" \
+      "$notify_timeout_sec" \
+      "$notify_poll_interval_sec" \
+      "${created_runs[@]}" >/dev/null
+    return 0
+  fi
+}
+
+resolve_job_context() {
+  local prefix="$1"
+  local pipeline_id="$2"
+  local action="$3"
+  local selection_file="$4"
+  local response_file="/tmp/qq-yunxiao-deploy.${prefix}.latest.json"
+  local job_name=""
+  local job_id=""
+
+  job_name="$(cfg_get "$prefix" "JOB_NAME")"
+  job_id="$(cfg_get "$prefix" "JOB_ID")"
+
+  api_request "GET" "$(pipeline_base_url "$pipeline_id")/runs/latestPipelineRun" "$response_file"
+  json_kv "$response_file" "$action" "$job_name" "$job_id" >"$selection_file"
+}
+
+run_pass_validate() {
+  local label="$1"
+  local pipeline_id="$2"
+  local prefix="$3"
+  local selection_file="/tmp/qq-yunxiao-deploy.${prefix}.pass.kv"
+  local pipeline_run_id=""
+  local pipeline_run_status=""
+  local job_id=""
+  local job_name=""
+  local response_file="/tmp/qq-yunxiao-deploy.${prefix}.pass.json"
+
+  resolve_job_context "$prefix" "$pipeline_id" "pass_validate" "$selection_file"
+  pipeline_run_id="$(kv_value "PIPELINE_RUN_ID" "$selection_file")"
+  pipeline_run_status="$(kv_value "PIPELINE_RUN_STATUS" "$selection_file")"
+  job_id="$(kv_value "JOB_ID" "$selection_file")"
+  job_name="$(kv_value "JOB_NAME" "$selection_file")"
+
+  if [[ -z "$pipeline_run_id" ]]; then
+    fail "pipeline_run_missing" 25 "这次没法部署，没找到最近一次流水线运行。" "${label} 的 latestPipelineRun 为空。"
+  fi
+  if [[ -z "$job_id" ]]; then
+    fail "validate_job_missing" 26 "这次没法部署，没找到可通过的人工卡点。" "最近运行状态：${pipeline_run_status:-unknown}；可见任务：$(kv_value "AVAILABLE_JOBS" "$selection_file")"
+  fi
+
+  api_request "POST" "$(pipeline_base_url "$pipeline_id")/runs/${pipeline_run_id}/jobs/${job_id}:pass" "$response_file"
+  completed_summaries+=("${label}：已通过卡点 ${job_name:-job#${job_id}}，run #${pipeline_run_id}")
+  target_summaries+=("${label}：已通过卡点 ${job_name:-job#${job_id}}，run #${pipeline_run_id}")
+}
+
+run_execute_job() {
+  local label="$1"
+  local pipeline_id="$2"
+  local prefix="$3"
+  local selection_file="/tmp/qq-yunxiao-deploy.${prefix}.job.kv"
+  local pipeline_run_id=""
+  local pipeline_run_status=""
+  local job_id=""
+  local job_name=""
+  local response_file="/tmp/qq-yunxiao-deploy.${prefix}.job.json"
+
+  resolve_job_context "$prefix" "$pipeline_id" "execute_job" "$selection_file"
+  pipeline_run_id="$(kv_value "PIPELINE_RUN_ID" "$selection_file")"
+  pipeline_run_status="$(kv_value "PIPELINE_RUN_STATUS" "$selection_file")"
+  job_id="$(kv_value "JOB_ID" "$selection_file")"
+  job_name="$(kv_value "JOB_NAME" "$selection_file")"
+
+  if [[ -z "$pipeline_run_id" ]]; then
+    fail "pipeline_run_missing" 27 "这次没法部署，没找到最近一次流水线运行。" "${label} 的 latestPipelineRun 为空。"
+  fi
+  if [[ -z "$job_id" ]]; then
+    fail "job_missing" 28 "这次没法部署，没找到可手动执行的任务。" "最近运行状态：${pipeline_run_status:-unknown}；请在 ${config_path} 里配置 ${prefix}_JOB_NAME 或 ${prefix}_JOB_ID。"
+  fi
+
+  api_request "POST" "$(pipeline_base_url "$pipeline_id")/runs/${pipeline_run_id}/jobs/${job_id}:execute" "$response_file"
+  completed_summaries+=("${label}：已启动手动任务 ${job_name:-job#${job_id}}，run #${pipeline_run_id}")
+  target_summaries+=("${label}：已启动手动任务 ${job_name:-job#${job_id}}，run #${pipeline_run_id}")
+}
+
+deploy_target() {
+  local target="$1"
+  local prefix
+  local label
+  local enabled
+  local kind
+  local action
+  local pipeline_id
+
+  prefix="$(upper_target "$target")"
+  enabled="$(cfg_get "$prefix" "ENABLED")"
+  if [[ -n "$enabled" ]] && ! bool_true "$enabled"; then
+    return 0
+  fi
+
+  kind="$(cfg_get "$prefix" "KIND")"
+  kind="${kind:-pipeline}"
+  if [[ "$kind" != "pipeline" ]]; then
+    fail "target_kind_unsupported" 29 "这次没法部署，当前只接了云效流水线 API。" "${target} 的 YUNXIAO_${prefix}_KIND=${kind} 还不支持。"
+  fi
+
+  label="$(cfg_get "$prefix" "LABEL")"
+  label="${label:-$target}"
+  action="$(cfg_get "$prefix" "ACTION")"
+  pipeline_id="$(cfg_get "$prefix" "PIPELINE_ID")"
+
+  if [[ -z "$action" ]]; then
+    fail "target_action_missing" 30 "这次没法部署，目标动作还没配。" "请在 ${config_path} 里配置 YUNXIAO_${prefix}_ACTION。"
+  fi
+  if [[ -z "$pipeline_id" ]]; then
+    fail "pipeline_id_missing" 31 "这次没法部署，流水线 ID 还没配。" "请在 ${config_path} 里配置 YUNXIAO_${prefix}_PIPELINE_ID。"
+  fi
+
+  case "$action" in
+    create_run)
+      run_create_pipeline "$label" "$pipeline_id" "$prefix"
+      ;;
+    pass_validate)
+      run_pass_validate "$label" "$pipeline_id" "$prefix"
+      ;;
+    execute_job)
+      run_execute_job "$label" "$pipeline_id" "$prefix"
+      ;;
+    *)
+      fail "target_action_invalid" 32 "这次没法部署，目标动作配置不对。" "YUNXIAO_${prefix}_ACTION 只支持 create_run、pass_validate、execute_job。"
+      ;;
+  esac
+}
+
+run_requested_targets() {
+  local raw_targets
+  local target
+
+  raw_targets="${YUNXIAO_DEPLOY_TARGETS:-backend frontend}"
+  raw_targets="${raw_targets//,/ }"
+
+  if [[ "$requested_target" != "all" ]]; then
+    deploy_target "$requested_target"
+    return 0
+  fi
+
+  for target in $raw_targets; do
+    deploy_target "$target"
+  done
+
+  if [[ "${#target_summaries[@]}" -eq 0 ]]; then
+    fail "target_empty" 33 "这次没法部署，没有可执行的目标。" "请在 ${config_path} 里配置 YUNXIAO_DEPLOY_TARGETS。"
+  fi
+}
+
+main() {
+  if [[ "$requested_target" == "-h" || "$requested_target" == "--help" || "$requested_target" == "help" ]]; then
+    usage
+    exit 0
+  fi
+
+  load_config
+  run_requested_targets
+  spawn_finish_notify
+
+  echo "QQ_RESULT=已触发云效部署。"
+  echo "QQ_DETAIL=$(join_by '；' "${target_summaries[@]}")。"
+}
+
+main

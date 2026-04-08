@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+threems_workspace="${THREEMS_WORKSPACE:-${WORKSPACE_ROOT:-/root/3ms}}"
+default_repo="${THREEMS_MAIN_REPO:-${threems_workspace}/sub2api-main}"
+repo="${1:-$default_repo}"
+
+if [[ ! -d "$repo/.git" ]]; then
+  echo "ERROR=repo_not_found"
+  echo "REPO=$repo"
+  exit 1
+fi
+
+branch="$(git -C "$repo" branch --show-current 2>/dev/null || true)"
+upstream_url="$(git -C "$repo" remote get-url upstream 2>/dev/null || true)"
+fetch_status="not_configured"
+fetch_error=""
+
+echo "REPO=$repo"
+echo "BRANCH=$branch"
+echo "UPSTREAM_URL=$upstream_url"
+
+if [[ -n "$upstream_url" ]]; then
+  if git -C "$repo" fetch upstream --prune >/tmp/qq-upstream-status.fetch.log 2>&1; then
+    fetch_status="ok"
+  else
+    fetch_status="failed"
+    fetch_error="$(tr '\n' ' ' </tmp/qq-upstream-status.fetch.log | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+  fi
+fi
+
+echo "FETCH_STATUS=$fetch_status"
+if [[ -n "$fetch_error" ]]; then
+  echo "FETCH_ERROR=$fetch_error"
+fi
+
+if git -C "$repo" rev-parse --verify upstream/main >/dev/null 2>&1; then
+  counts="$(git -C "$repo" rev-list --left-right --count HEAD...upstream/main)"
+  ahead="$(printf '%s\n' "$counts" | awk '{print $1}')"
+  behind="$(printf '%s\n' "$counts" | awk '{print $2}')"
+  latest="$(git -C "$repo" log -1 --date=iso-strict --pretty=format:'%h %ad %s' upstream/main)"
+  today_file="$(mktemp)"
+  TZ=Asia/Shanghai git -C "$repo" log \
+    --since='today 00:00' \
+    --until='tomorrow 00:00' \
+    --date=iso-strict \
+    --pretty=format:'%h %ad %s' \
+    upstream/main >"$today_file" || true
+  today_count="$(grep -c '^[^[:space:]]' "$today_file" || true)"
+  echo "UPSTREAM_MAIN_EXISTS=1"
+  echo "AHEAD=$ahead"
+  echo "BEHIND=$behind"
+  printf 'UPSTREAM_LATEST=%s\n' "$latest"
+  echo "UPSTREAM_TODAY_COUNT=$today_count"
+  if [[ "$today_count" -gt 0 ]]; then
+    echo "UPSTREAM_TODAY_COMMITS_BEGIN"
+    cat "$today_file"
+    echo "UPSTREAM_TODAY_COMMITS_END"
+  fi
+  rm -f "$today_file"
+else
+  echo "UPSTREAM_MAIN_EXISTS=0"
+fi

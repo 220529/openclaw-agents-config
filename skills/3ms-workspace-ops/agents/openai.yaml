@@ -1,0 +1,4 @@
+interface:
+  display_name: "3ms Workspace Ops"
+  short_description: "Operate /root/3ms Git and sync workflows"
+  default_prompt: "Use $3ms-workspace-ops to handle a /root/3ms workspace request for QQ bot 1903744595."

@@ -1,0 +1,67 @@
+#!/usr/bin/env node
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+function resolveOpenClawModule(relativePath) {
+  const roots = [];
+  if (process.env.OPENCLAW_NODE_MODULES_DIR) {
+    roots.push(process.env.OPENCLAW_NODE_MODULES_DIR.trim());
+  }
+  try {
+    roots.push(execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim());
+  } catch {
+    // ignore and fall through
+  }
+
+  for (const root of roots) {
+    if (!root) {
+      continue;
+    }
+    const candidate = path.join(root, "openclaw", relativePath);
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  throw new Error("openclaw global module path not found");
+}
+
+const configRuntimePath = resolveOpenClawModule("dist/plugin-sdk/config-runtime.js");
+const qqApiPath = resolveOpenClawModule("dist/extensions/qqbot/api.js");
+const { loadConfig } = await import(pathToFileURL(configRuntimePath).href);
+const { sendProactive } = await import(pathToFileURL(qqApiPath).href);
+
+const [targetArg, ...messageParts] = process.argv.slice(2);
+
+if (!targetArg || messageParts.length === 0) {
+  process.exit(1);
+}
+
+let type = "c2c";
+let to = targetArg;
+
+if (targetArg.startsWith("qqbot:c2c:")) {
+  to = targetArg.slice("qqbot:c2c:".length);
+} else if (targetArg.startsWith("qqbot:group:")) {
+  type = "group";
+  to = targetArg.slice("qqbot:group:".length);
+} else if (targetArg.startsWith("group:")) {
+  type = "group";
+  to = targetArg.slice("group:".length);
+} else if (targetArg.startsWith("c2c:")) {
+  to = targetArg.slice("c2c:".length);
+}
+
+const text = messageParts.join(" ").trim();
+if (!text) {
+  process.exit(1);
+}
+
+const cfg = loadConfig();
+const result = await sendProactive({ to, text, type, accountId: "default" }, cfg);
+if (!result.success) {
+  console.error(result.error || "send failed");
+  process.exit(1);
+}

@@ -1,0 +1,66 @@
+# Copy this file to /root/.openclaw/qq-yunxiao-deploy.conf and fill the blanks.
+#
+# Security notes:
+# - Prefer keeping the PAT in a separate file and point YUNXIAO_API_TOKEN_FILE to it.
+# - Do not put PAT into prompt, profile, or memory files.
+# - This script currently targets Yunxiao flow pipeline APIs.
+
+YUNXIAO_API_EDITION="center"
+YUNXIAO_API_DOMAIN="openapi-rdc.aliyuncs.com"
+YUNXIAO_ORGANIZATION_ID=""
+YUNXIAO_API_TOKEN_FILE="/root/.openclaw/yunxiao-pat.txt"
+
+# Targets to run when the QQ user sends: 执行云效部署
+YUNXIAO_DEPLOY_TARGETS="backend frontend"
+
+# Optional async QQ follow-up after create_run completes.
+# Example target:
+# - c2c:<user_openid>
+# - group:<group_openid>
+# - qqbot:c2c:<user_openid>
+YUNXIAO_NOTIFY_ON_FINISH="0"
+YUNXIAO_NOTIFY_TO=""
+YUNXIAO_NOTIFY_TIMEOUT_SEC="1800"
+YUNXIAO_NOTIFY_POLL_INTERVAL_SEC="15"
+
+# Supported ACTION values:
+# - create_run
+# - pass_validate
+# - execute_job
+#
+# For create_run:
+# - fill PIPELINE_ID
+# - optionally fill CREATE_RUN_PARAMS_JSON or CREATE_RUN_PARAMS_FILE
+# - if the pipeline requires choosing a branch at runtime, set USE_CURRENT_BRANCH=1
+#   and pass QQ_YUNXIAO_BRANCH through qq-3ms-intent
+#
+# For pass_validate:
+# - fill PIPELINE_ID
+# - JOB_NAME is recommended; if omitted, the script tries to locate the first
+#   active PassPipelineValidate action on the latest pipeline run
+#
+# For execute_job:
+# - fill PIPELINE_ID
+# - JOB_NAME or JOB_ID is strongly recommended
+
+YUNXIAO_BACKEND_ENABLED="1"
+YUNXIAO_BACKEND_LABEL="3ms_backend"
+YUNXIAO_BACKEND_KIND="pipeline"
+YUNXIAO_BACKEND_ACTION="create_run"
+YUNXIAO_BACKEND_PIPELINE_ID=""
+YUNXIAO_BACKEND_JOB_NAME=""
+YUNXIAO_BACKEND_JOB_ID=""
+YUNXIAO_BACKEND_CREATE_RUN_PARAMS_JSON=""
+YUNXIAO_BACKEND_CREATE_RUN_PARAMS_FILE=""
+YUNXIAO_BACKEND_USE_CURRENT_BRANCH="0"
+
+YUNXIAO_FRONTEND_ENABLED="1"
+YUNXIAO_FRONTEND_LABEL="3ms_frontend"
+YUNXIAO_FRONTEND_KIND="pipeline"
+YUNXIAO_FRONTEND_ACTION="create_run"
+YUNXIAO_FRONTEND_PIPELINE_ID=""
+YUNXIAO_FRONTEND_JOB_NAME=""
+YUNXIAO_FRONTEND_JOB_ID=""
+YUNXIAO_FRONTEND_CREATE_RUN_PARAMS_JSON=""
+YUNXIAO_FRONTEND_CREATE_RUN_PARAMS_FILE=""
+YUNXIAO_FRONTEND_USE_CURRENT_BRANCH="0"

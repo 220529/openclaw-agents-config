@@ -1,0 +1,23 @@
+[Unit]
+Description=OpenClaw Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${HOME}
+EnvironmentFile=%h/.config/openclaw/openclaw.env
+Environment=HOME=${HOME}
+Environment=TMPDIR=/tmp
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin
+ExecStart=/usr/bin/env bash -lc 'node "$(npm root -g)/openclaw/dist/index.js" gateway --port "${OPENCLAW_GATEWAY_PORT}"'
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+TimeoutStartSec=30
+SuccessExitStatus=0 143
+KillMode=control-group
+
+[Install]
+WantedBy=default.target
+

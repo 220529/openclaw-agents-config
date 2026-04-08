@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+env_file="${OPENCLAW_CONFIG_ENV:-${HOME}/.config/openclaw/openclaw.env}"
+restart_service="0"
+skip_systemd="${OPENCLAW_SKIP_SYSTEMD:-0}"
+
+for arg in "$@"; do
+  case "$arg" in
+    --restart)
+      restart_service="1"
+      ;;
+    --skip-systemd)
+      skip_systemd="1"
+      ;;
+    *)
+      echo "unknown argument: $arg" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ ! -f "$env_file" ]]; then
+  echo "missing env file: $env_file" >&2
+  echo "copy env/openclaw.env.example to that path first" >&2
+  exit 1
+fi
+
+set -a
+# shellcheck disable=SC1090
+. "$env_file"
+set +a
+
+codex_home="${CODEX_HOME:-${HOME}/.codex}"
+openclaw_home="${OPENCLAW_HOME:-${HOME}/.openclaw}"
+openclaw_workspace="${OPENCLAW_WORKSPACE:-${openclaw_home}/workspace}"
+systemd_user_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
+
+mkdir -p \
+  "${codex_home}/skills" \
+  "${openclaw_workspace}/bin" \
+  "${openclaw_workspace}/profiles/qq" \
+  "${openclaw_workspace}/.openclaw" \
+  "${systemd_user_dir}" \
+  "$(dirname "$env_file")"
+
+rm -rf "${codex_home}/skills/3ms-workspace-ops"
+cp -a "${repo_root}/skills/3ms-workspace-ops" "${codex_home}/skills/"
+cp -a "${repo_root}/scripts/." "${openclaw_workspace}/bin/"
+cp -a "${repo_root}/runtime/profiles/qq/." "${openclaw_workspace}/profiles/qq/"
+cp "${repo_root}/env/qq-yunxiao-deploy.conf.example" "${openclaw_workspace}/.openclaw/qq-yunxiao-deploy.conf.example"
+
+chmod +x \
+  "${repo_root}/bootstrap/render_template.py" \
+  "${repo_root}/bootstrap/restore.sh" \
+  "${repo_root}/bootstrap/install.sh" \
+  "${repo_root}/bootstrap/doctor.sh" \
+  "${openclaw_workspace}/bin/"*
+
+python3 "${repo_root}/bootstrap/render_template.py" \
+  "${repo_root}/runtime/openclaw/openclaw.json.template" \
+  "${openclaw_home}/openclaw.json"
+
+python3 "${repo_root}/bootstrap/render_template.py" \
+  "${repo_root}/runtime/systemd/openclaw-gateway.service.template" \
+  "${systemd_user_dir}/openclaw-gateway.service"
+
+if [[ "$skip_systemd" != "1" ]]; then
+  systemctl --user daemon-reload
+  if [[ "$restart_service" == "1" ]]; then
+    systemctl --user restart openclaw-gateway
+  fi
+fi
+
+echo "restored config into:"
+echo "  skill: ${codex_home}/skills/3ms-workspace-ops"
+echo "  workspace: ${openclaw_workspace}"
+echo "  config: ${openclaw_home}/openclaw.json"
+echo "  service: ${systemd_user_dir}/openclaw-gateway.service"

@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+openclaw_home="${OPENCLAW_HOME:-${HOME:-/root}/.openclaw}"
+openclaw_workspace="${OPENCLAW_WORKSPACE:-${openclaw_home}/workspace}"
+workspace="${THREEMS_WORKSPACE:-${WORKSPACE_ROOT:-/root/3ms}}"
+main_repo="${THREEMS_MAIN_REPO:-${workspace}/sub2api-main}"
+backend_repo="${THREEMS_BACKEND_REPO:-${workspace}/3ms_backend}"
+frontend_repo="${THREEMS_FRONTEND_REPO:-${workspace}/3ms_frontend}"
+sync_all_script="${main_repo}/scripts/sync-all.sh"
+proactive_send_script="${QQBOT_PROACTIVE_SEND_SCRIPT:-${openclaw_workspace}/bin/qqbot-proactive-send}"
+progress_notify_to="${QQ_PROGRESS_NOTIFY_TO:-}"
+
+discarded_repos=()
+updated_repos=()
+unchanged_repos=()
+
+current_branch() {
+  local repo="$1"
+  git -C "$repo" branch --show-current
+}
+
+join_by() {
+  local sep="$1"
+  shift
+  local out=""
+  local item
+  for item in "$@"; do
+    if [[ -z "$out" ]]; then
+      out="$item"
+    else
+      out="${out}${sep}${item}"
+    fi
+  done
+  printf '%s' "$out"
+}
+
+first_nonempty_line() {
+  local file="$1"
+  sed -n '/[^[:space:]]/ { p; q; }' "$file"
+}
+
+fail() {
+  local error_code="$1"
+  local exit_code="$2"
+  local result="$3"
+  local detail="${4:-}"
+
+  echo "QQ_RESULT=${result}"
+  if [[ -n "$detail" ]]; then
+    echo "QQ_DETAIL=${detail}"
+  fi
+  echo "ERROR=${error_code}"
+  exit "$exit_code"
+}
+
+repo_status() {
+  local repo="$1"
+  git -C "$repo" status --porcelain
+}
+
+send_progress_notify() {
+  local text="$1"
+
+  if [[ -z "$progress_notify_to" || ! -x "$proactive_send_script" ]]; then
+    return 0
+  fi
+
+  "$proactive_send_script" "$progress_notify_to" "$text" >/dev/null 2>&1 || true
+}
+
+discard_repo_changes() {
+  local name="$1"
+  local repo="$2"
+  local status
+  local first_line
+  local safe_name
+  local reset_log
+  local clean_log
+
+  status="$(repo_status "$repo")"
+  if [[ -n "$status" ]]; then
+    first_line="$(printf '%s\n' "$status" | sed -n '1p')"
+    safe_name="${name//[^A-Za-z0-9_.-]/_}"
+    reset_log="/tmp/qq-update-workspace.${safe_name}.reset.log"
+    clean_log="/tmp/qq-update-workspace.${safe_name}.clean.log"
+
+    if ! git -C "$repo" reset --hard HEAD >"$reset_log" 2>&1; then
+      fail "discard_failed" 21 "这次没法更新，${name} 本地改动丢弃失败。" "$(first_nonempty_line "$reset_log")"
+    fi
+    if ! git -C "$repo" clean -fd >"$clean_log" 2>&1; then
+      fail "discard_failed" 21 "这次没法更新，${name} 未跟踪文件清理失败。" "$(first_nonempty_line "$clean_log")"
+    fi
+
+    discarded_repos+=("$name")
+    echo "REPO=${name}"
+    echo "DIRTY=1"
+    echo "DIRTY_CONTENT_BEGIN"
+    printf '%s\n' "$status"
+    echo "DIRTY_CONTENT_END"
+    echo "DISCARDED=1"
+    return 0
+  fi
+  echo "REPO=${name}"
+  echo "DIRTY=0"
+  return 0
+}
+
+ensure_repo_on_branch() {
+  local repo="$1"
+  local label="$2"
+  local branch="$3"
+  local current
+
+  current="$(current_branch "$repo" || true)"
+  if [[ "$current" == "$branch" ]]; then
+    return
+  fi
+
+  if git -C "$repo" show-ref --verify --quiet "refs/heads/${branch}"; then
+    git -C "$repo" checkout "$branch" >/dev/null
+    return
+  fi
+
+  if git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
+    git -C "$repo" checkout -B "$branch" "origin/${branch}" >/dev/null
+    return
+  fi
+
+  fail "${label}_branch_missing" 12 "这次没法更新，${label} 仓库缺少目标分支。" "${label} 需要分支：${branch}"
+}
+
+ensure_git_identity() {
+  local user_name
+  local user_email
+
+  user_name="$(git -C "$main_repo" config user.name || true)"
+  user_email="$(git -C "$main_repo" config user.email || true)"
+  if [[ -z "$user_name" || -z "$user_email" ]]; then
+    fail "git_identity_missing" 13 "这次没法自动提交，Git 身份没配置。" "请先配置 user.name 和 user.email。"
+  fi
+
+  echo "GIT_USER_NAME=${user_name}"
+  echo "GIT_USER_EMAIL=${user_email}"
+}
+
+push_branch() {
+  local repo="$1"
+  local label="$2"
+  local branch="$3"
+  local error_code="$4"
+  local exit_code="$5"
+  local log_file
+
+  log_file="/tmp/qq-update-workspace.${error_code}.log"
+  if ! git -C "$repo" push origin "$branch" >"$log_file" 2>&1; then
+    fail "$error_code" "$exit_code" "这次更新失败，${label} push 失败。" "$(first_nonempty_line "$log_file")"
+  fi
+}
+
+commit_and_push_repo() {
+  local repo="$1"
+  local label="$2"
+  local branch="$3"
+  local commit_message="$4"
+  local key="$5"
+  local status
+  local add_log
+  local commit_log
+  local commit_sha
+
+  status="$(repo_status "$repo")"
+  if [[ -z "$status" ]]; then
+    unchanged_repos+=("$label")
+    echo "${key}_CHANGED=0"
+    return 0
+  fi
+
+  add_log="/tmp/qq-update-workspace.${key}.add.log"
+  commit_log="/tmp/qq-update-workspace.${key}.commit.log"
+
+  if ! git -C "$repo" add -A >"$add_log" 2>&1; then
+    fail "${key}_add_failed" 51 "这次更新失败，${label} 暂存改动失败。" "$(first_nonempty_line "$add_log")"
+  fi
+  if ! git -C "$repo" commit -m "$commit_message" >"$commit_log" 2>&1; then
+    fail "${key}_commit_failed" 52 "这次更新失败，${label} commit 失败。" "$(first_nonempty_line "$commit_log")"
+  fi
+
+  commit_sha="$(git -C "$repo" rev-parse --short HEAD)"
+  updated_repos+=("$label")
+  echo "${key}_CHANGED=1"
+  echo "${key}_COMMIT=${commit_sha}"
+
+  push_branch "$repo" "$label" "$branch" "${key}_push_failed" 53
+}
+
+today_count() {
+  TZ=Asia/Shanghai git -C "$main_repo" log \
+    --since='today 00:00' \
+    --until='tomorrow 00:00' \
+    --oneline upstream/main --max-count=50 | wc -l | tr -d ' '
+}
+
+target_branch="$(git -C "$main_repo" branch --show-current)"
+echo "WORKSPACE=${workspace}"
+echo "BRANCH=${target_branch}"
+echo "SUB2API_BRANCH_BEFORE=${target_branch}"
+echo "BACKEND_BRANCH_BEFORE=$(git -C "$backend_repo" branch --show-current)"
+echo "FRONTEND_BRANCH_BEFORE=$(git -C "$frontend_repo" branch --show-current)"
+
+if [[ ! -x "$sync_all_script" ]]; then
+  fail "sync_script_missing" 14 "这次没法更新，找不到子项目同步脚本。" "$sync_all_script"
+fi
+
+if ! git -C "$main_repo" remote get-url upstream >/dev/null 2>&1; then
+  fail "upstream_missing" 11 "这次没法更新，主仓库还没配置 upstream。"
+fi
+
+discard_repo_changes "sub2api-main" "$main_repo"
+discard_repo_changes "3ms_backend" "$backend_repo"
+discard_repo_changes "3ms_frontend" "$frontend_repo"
+
+ensure_repo_on_branch "$backend_repo" "backend" "$target_branch"
+ensure_repo_on_branch "$frontend_repo" "frontend" "$target_branch"
+
+if ! git -C "$main_repo" fetch upstream --prune >/tmp/qq-update-workspace.fetch.log 2>&1; then
+  fail "fetch_failed" 30 "这次没法更新，拉取 upstream 失败。" "$(tr '\n' ' ' </tmp/qq-update-workspace.fetch.log | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+fi
+
+counts="$(git -C "$main_repo" rev-list --left-right --count HEAD...upstream/main)"
+ahead="$(printf '%s\n' "$counts" | awk '{print $1}')"
+behind="$(printf '%s\n' "$counts" | awk '{print $2}')"
+today_updates="$(today_count)"
+echo "AHEAD_BEFORE=${ahead}"
+echo "BEHIND_BEFORE=${behind}"
+echo "UPSTREAM_TODAY_COUNT=${today_updates}"
+
+if [[ "$behind" == "0" ]]; then
+  echo "QQ_RESULT=不用更新，已经是最新。"
+  no_update_detail=()
+  if [[ "$today_updates" == "0" ]]; then
+    no_update_detail+=("今天上游 main 没新提交")
+  fi
+  if [[ "${#discarded_repos[@]}" -gt 0 ]]; then
+    no_update_detail+=("已丢弃本地改动：$(join_by '、' "${discarded_repos[@]}")")
+  fi
+  if [[ "${#no_update_detail[@]}" -gt 0 ]]; then
+    echo "QQ_DETAIL=$(join_by '；' "${no_update_detail[@]}")。"
+  fi
+  echo "RESULT=up_to_date"
+  exit 0
+fi
+
+ensure_git_identity
+
+main_before="$(git -C "$main_repo" rev-parse --short HEAD)"
+merge_log="/tmp/qq-update-workspace.merge.log"
+set +e
+git -C "$main_repo" merge --no-ff --no-edit upstream/main >"$merge_log" 2>&1
+merge_exit=$?
+set -e
+
+if [[ "$merge_exit" -ne 0 ]]; then
+  conflict_count="$(git -C "$main_repo" diff --name-only --diff-filter=U | sed '/^$/d' | wc -l | tr -d ' ')"
+  if [[ "$conflict_count" != "0" ]]; then
+    conflict_preview="$(git -C "$main_repo" diff --name-only --diff-filter=U | sed -n '1,5p' | paste -sd '、' -)"
+    git -C "$main_repo" merge --abort >/dev/null 2>&1 || true
+    if [[ "$conflict_count" -gt 5 ]]; then
+      conflict_preview="${conflict_preview} 等 ${conflict_count} 个文件"
+    fi
+    fail "merge_conflict" 40 "这次更新失败，主仓库 merge 出现冲突。" "冲突已中止，文件：${conflict_preview}"
+  fi
+
+  fail "merge_failed" 41 "这次更新失败，主仓库 merge 失败。" "$(first_nonempty_line "$merge_log")"
+fi
+
+main_after="$(git -C "$main_repo" rev-parse --short HEAD)"
+echo "MAIN_BEFORE=${main_before}"
+echo "MAIN_AFTER=${main_after}"
+
+push_branch "$main_repo" "sub2api-main" "$target_branch" "main_push_failed" 42
+updated_repos+=("sub2api-main")
+if [[ "$main_before" == "$main_after" ]]; then
+  send_progress_notify "主项目已经包含 upstream/main，并已推送。"
+else
+  send_progress_notify "主项目已合并 upstream/main 并推送。${main_before} -> ${main_after}。"
+fi
+
+backend_before="$(git -C "$backend_repo" rev-parse --short HEAD)"
+frontend_before="$(git -C "$frontend_repo" rev-parse --short HEAD)"
+
+if ! "$sync_all_script" >/tmp/qq-update-workspace.sync.log 2>&1; then
+  fail "sync_failed" 43 "这次更新失败，两个子项目同步失败。" "主仓库已 push；$(first_nonempty_line /tmp/qq-update-workspace.sync.log)"
+fi
+
+commit_message="chore: sync from sub2api-main ${main_after}"
+commit_and_push_repo "$backend_repo" "3ms_backend" "$target_branch" "$commit_message" "BACKEND"
+commit_and_push_repo "$frontend_repo" "3ms_frontend" "$target_branch" "$commit_message" "FRONTEND"
+
+stage_detail_parts=()
+if [[ "${#updated_repos[@]}" -gt 1 ]]; then
+  stage_detail_parts+=("已 commit+push：$(join_by '、' "${updated_repos[@]:1}")")
+fi
+if [[ "${#unchanged_repos[@]}" -gt 0 ]]; then
+  stage_detail_parts+=("无同步改动：$(join_by '、' "${unchanged_repos[@]}")")
+fi
+if [[ "${#updated_repos[@]}" -le 1 ]]; then
+  if [[ "${#stage_detail_parts[@]}" -eq 0 ]]; then
+    send_progress_notify "子项目已完成同步。两个子项目都无同步改动。"
+  else
+    send_progress_notify "子项目已完成同步。$(join_by '；' "${stage_detail_parts[@]}")。"
+  fi
+else
+  send_progress_notify "子项目已同步并推送完成。$(join_by '；' "${stage_detail_parts[@]}")。"
+fi
+
+final_detail_parts=("已 commit+push：$(join_by '、' "${updated_repos[@]}")")
+if [[ "${#unchanged_repos[@]}" -gt 0 ]]; then
+  final_detail_parts+=("无同步改动：$(join_by '、' "${unchanged_repos[@]}")")
+fi
+if [[ "${#discarded_repos[@]}" -gt 0 ]]; then
+  final_detail_parts+=("已丢弃本地改动：$(join_by '、' "${discarded_repos[@]}")")
+fi
+final_detail_parts+=("未部署")
+
+echo "QQ_RESULT=已更新并推送完成。"
+echo "QQ_DETAIL=$(join_by '；' "${final_detail_parts[@]}")。"
+echo "RESULT=updated"
+echo "BACKEND_BEFORE=${backend_before}"
+echo "BACKEND_AFTER=$(git -C "$backend_repo" rev-parse --short HEAD)"
+echo "FRONTEND_BEFORE=${frontend_before}"
+echo "FRONTEND_AFTER=$(git -C "$frontend_repo" rev-parse --short HEAD)"
+echo "SUB2API_BRANCH_AFTER=$(git -C "$main_repo" branch --show-current)"
+echo "BACKEND_BRANCH_AFTER=$(git -C "$backend_repo" branch --show-current)"
+echo "FRONTEND_BRANCH_AFTER=$(git -C "$frontend_repo" branch --show-current)"
+echo "POST_MAIN_DIRTY=$(test -n "$(git -C "$main_repo" status --porcelain)" && echo 1 || echo 0)"
+echo "POST_BACKEND_DIRTY=$(test -n "$(git -C "$backend_repo" status --porcelain)" && echo 1 || echo 0)"
+echo "POST_FRONTEND_DIRTY=$(test -n "$(git -C "$frontend_repo" status --porcelain)" && echo 1 || echo 0)"
