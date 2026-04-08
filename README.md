@@ -40,8 +40,8 @@ The repository only keeps examples and templates.
 ## Restore Flow
 
 1. Clone this repository.
-2. Create `~/.config/openclaw/openclaw.env` from `env/openclaw.env.example`.
-3. Fill required secrets and paths.
+2. Run `bootstrap/init-secrets.sh`.
+3. Fill required secrets and paths in the generated local files.
 4. Run `bootstrap/secrets-check.sh`.
 5. Run `bootstrap/restore.sh`.
 6. Run `bootstrap/doctor.sh`.
@@ -56,10 +56,17 @@ These usually come from the machine's global Node/OpenClaw installation.
 
 ## Validation
 
+- `bootstrap/init-secrets.sh`
+  - creates local env/config files from repository examples with safe permissions
 - `bootstrap/secrets-check.sh`
   - validates local env and deploy secrets before restore
 - `bootstrap/doctor.sh`
   - validates rendered config, scripts, and installed file layout after restore
+
+## Docs
+
+- `docs/migration.md`
+  - end-to-end migration and rebuild checklist
 
 ## Current Contract
 
