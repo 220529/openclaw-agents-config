@@ -42,9 +42,10 @@ The repository only keeps examples and templates.
 1. Clone this repository.
 2. Create `~/.config/openclaw/openclaw.env` from `env/openclaw.env.example`.
 3. Fill required secrets and paths.
-4. Run `bootstrap/restore.sh`.
-5. Run `bootstrap/doctor.sh`.
-6. If needed, restart the gateway with `bootstrap/install.sh --restart`.
+4. Run `bootstrap/secrets-check.sh`.
+5. Run `bootstrap/restore.sh`.
+6. Run `bootstrap/doctor.sh`.
+7. If needed, restart the gateway with `bootstrap/install.sh --restart`.
 
 Important machine-specific values:
 
@@ -52,6 +53,13 @@ Important machine-specific values:
 - `OPENCLAW_NODE_MODULES_DIR`
 
 These usually come from the machine's global Node/OpenClaw installation.
+
+## Validation
+
+- `bootstrap/secrets-check.sh`
+  - validates local env and deploy secrets before restore
+- `bootstrap/doctor.sh`
+  - validates rendered config, scripts, and installed file layout after restore
 
 ## Current Contract
 
