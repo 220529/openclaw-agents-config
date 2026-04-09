@@ -14,6 +14,11 @@ progress_notify_to="${QQ_PROGRESS_NOTIFY_TO:-}"
 discarded_repos=()
 updated_repos=()
 unchanged_repos=()
+origin_synced="0"
+origin_pull_before=""
+origin_pull_after=""
+origin_remote_only="0"
+origin_local_only="0"
 
 current_branch() {
   local repo="$1"
@@ -38,6 +43,44 @@ join_by() {
 first_nonempty_line() {
   local file="$1"
   sed -n '/[^[:space:]]/ { p; q; }' "$file"
+}
+
+best_error_line() {
+  local file="$1"
+  local line
+
+  line="$(sed -n '/^ssh:/ { p; q; }' "$file")"
+  if [[ -n "$line" ]]; then
+    printf '%s' "$line"
+    return 0
+  fi
+
+  line="$(sed -n '/^fatal:/ { p; q; }' "$file")"
+  if [[ -n "$line" ]]; then
+    printf '%s' "$line"
+    return 0
+  fi
+
+  line="$(sed -n '/^error:/I { p; q; }' "$file")"
+  if [[ -n "$line" ]]; then
+    printf '%s' "$line"
+    return 0
+  fi
+
+  line="$(sed -n '/rejected/I { p; q; }' "$file")"
+  if [[ -n "$line" ]]; then
+    printf '%s' "$line"
+    return 0
+  fi
+
+  line="$(sed -n '/non-fast-forward/I { p; q; }' "$file")"
+  if [[ -n "$line" ]]; then
+    printf '%s' "$line"
+    return 0
+  fi
+
+  line="$(first_nonempty_line "$file")"
+  printf '%s' "$line"
 }
 
 fail() {
@@ -144,6 +187,127 @@ ensure_git_identity() {
   echo "GIT_USER_EMAIL=${user_email}"
 }
 
+ensure_origin_remote() {
+  local repo="$1"
+  local label="$2"
+
+  if ! git -C "$repo" remote get-url origin >/dev/null 2>&1; then
+    fail "${label}_origin_missing" 14 "这次没法更新，${label} 没配置 origin。"
+  fi
+}
+
+sync_repo_from_origin_for_push_retry() {
+  local repo="$1"
+  local label="$2"
+  local branch="$3"
+  local safe_label
+  local fetch_log
+  local pull_log
+  local remote_only_count
+  local local_only_count
+  local pull_exit
+  local conflict_count
+  local conflict_preview
+
+  safe_label="${label//[^A-Za-z0-9_.-]/_}"
+  fetch_log="/tmp/qq-update-workspace.${safe_label}.push-retry.fetch-origin.log"
+  pull_log="/tmp/qq-update-workspace.${safe_label}.push-retry.pull-origin.log"
+
+  ensure_origin_remote "$repo" "$label"
+
+  if ! git -C "$repo" fetch origin "refs/heads/${branch}:refs/remotes/origin/${branch}" >"$fetch_log" 2>&1; then
+    fail "${safe_label}_fetch_origin_failed" 31 "这次更新失败，${label} push 前补拉 origin 失败。" "$(best_error_line "$fetch_log")"
+  fi
+
+  read -r remote_only_count local_only_count < <(
+    git -C "$repo" rev-list --left-right --count "origin/${branch}...HEAD"
+  )
+
+  if [[ "$remote_only_count" -eq 0 ]]; then
+    return 0
+  fi
+
+  set +e
+  git -C "$repo" pull --no-rebase --no-edit origin "$branch" >"$pull_log" 2>&1
+  pull_exit=$?
+  set -e
+
+  if [[ "$pull_exit" -ne 0 ]]; then
+    conflict_count="$(git -C "$repo" diff --name-only --diff-filter=U | sed '/^$/d' | wc -l | tr -d ' ')"
+    if [[ "$conflict_count" != "0" ]]; then
+      conflict_preview="$(git -C "$repo" diff --name-only --diff-filter=U | sed -n '1,5p' | paste -sd '、' -)"
+      git -C "$repo" merge --abort >/dev/null 2>&1 || true
+      if [[ "$conflict_count" -gt 5 ]]; then
+        conflict_preview="${conflict_preview} 等 ${conflict_count} 个文件"
+      fi
+      fail "${safe_label}_origin_pull_conflict" 32 "这次更新失败，${label} push 前补拉 origin 出现冲突。" "冲突已中止，文件：${conflict_preview}"
+    fi
+
+    fail "${safe_label}_origin_pull_failed" 33 "这次更新失败，${label} push 前补拉 origin 失败。" "$(best_error_line "$pull_log")"
+  fi
+}
+
+sync_main_repo_from_origin_before_upstream() {
+  local fetch_log="/tmp/qq-update-workspace.fetch-origin.log"
+  local pull_log="/tmp/qq-update-workspace.pull-origin.log"
+  local pull_exit
+  local conflict_count
+  local conflict_preview
+
+  ensure_origin_remote "$main_repo" "sub2api-main"
+
+  origin_pull_before="$(git -C "$main_repo" rev-parse --short HEAD)"
+  if ! git -C "$main_repo" fetch origin "refs/heads/${target_branch}:refs/remotes/origin/${target_branch}" >"$fetch_log" 2>&1; then
+    fail "fetch_origin_failed" 29 "这次没法更新，拉取 origin 失败。" "$(best_error_line "$fetch_log")"
+  fi
+
+  read -r origin_remote_only origin_local_only < <(
+    git -C "$main_repo" rev-list --left-right --count "origin/${target_branch}...HEAD"
+  )
+
+  echo "ORIGIN_REMOTE_ONLY_BEFORE=${origin_remote_only}"
+  echo "ORIGIN_LOCAL_ONLY_BEFORE=${origin_local_only}"
+
+  if [[ "$origin_remote_only" -eq 0 ]]; then
+    origin_pull_after="$origin_pull_before"
+    return 0
+  fi
+
+  set +e
+  git -C "$main_repo" pull --no-rebase --no-edit origin "$target_branch" >"$pull_log" 2>&1
+  pull_exit=$?
+  set -e
+
+  if [[ "$pull_exit" -ne 0 ]]; then
+    conflict_count="$(git -C "$main_repo" diff --name-only --diff-filter=U | sed '/^$/d' | wc -l | tr -d ' ')"
+    if [[ "$conflict_count" != "0" ]]; then
+      conflict_preview="$(git -C "$main_repo" diff --name-only --diff-filter=U | sed -n '1,5p' | paste -sd '、' -)"
+      git -C "$main_repo" merge --abort >/dev/null 2>&1 || true
+      if [[ "$conflict_count" -gt 5 ]]; then
+        conflict_preview="${conflict_preview} 等 ${conflict_count} 个文件"
+      fi
+      fail "origin_pull_conflict" 34 "这次更新失败，主仓库 git pull origin 出现冲突。" "冲突已中止，文件：${conflict_preview}"
+    fi
+
+    fail "origin_pull_failed" 35 "这次更新失败，主仓库 git pull origin 失败。" "$(best_error_line "$pull_log")"
+  fi
+
+  origin_pull_after="$(git -C "$main_repo" rev-parse --short HEAD)"
+  origin_synced="1"
+  echo "ORIGIN_PULL_BEFORE=${origin_pull_before}"
+  echo "ORIGIN_PULL_AFTER=${origin_pull_after}"
+}
+
+push_needs_origin_retry() {
+  local log_file="$1"
+
+  if grep -Eiq '\(fetch first\)|non-fast-forward|failed to push some refs|updates were rejected because the remote contains work' "$log_file"; then
+    return 0
+  fi
+
+  return 1
+}
+
 push_branch() {
   local repo="$1"
   local label="$2"
@@ -153,9 +317,18 @@ push_branch() {
   local log_file
 
   log_file="/tmp/qq-update-workspace.${error_code}.log"
-  if ! git -C "$repo" push origin "$branch" >"$log_file" 2>&1; then
-    fail "$error_code" "$exit_code" "这次更新失败，${label} push 失败。" "$(first_nonempty_line "$log_file")"
+  if git -C "$repo" push origin "$branch" >"$log_file" 2>&1; then
+    return 0
   fi
+
+  if push_needs_origin_retry "$log_file"; then
+    sync_repo_from_origin_for_push_retry "$repo" "$label" "$branch"
+    if git -C "$repo" push origin "$branch" >"$log_file" 2>&1; then
+      return 0
+    fi
+  fi
+
+  fail "$error_code" "$exit_code" "这次更新失败，${label} push 失败。" "$(best_error_line "$log_file")"
 }
 
 commit_and_push_repo() {
@@ -223,6 +396,9 @@ discard_repo_changes "3ms_frontend" "$frontend_repo"
 ensure_repo_on_branch "$backend_repo" "backend" "$target_branch"
 ensure_repo_on_branch "$frontend_repo" "frontend" "$target_branch"
 
+main_before="$(git -C "$main_repo" rev-parse --short HEAD)"
+sync_main_repo_from_origin_before_upstream
+
 if ! git -C "$main_repo" fetch upstream --prune >/tmp/qq-update-workspace.fetch.log 2>&1; then
   fail "fetch_failed" 30 "这次没法更新，拉取 upstream 失败。" "$(tr '\n' ' ' </tmp/qq-update-workspace.fetch.log | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
 fi
@@ -236,6 +412,74 @@ echo "BEHIND_BEFORE=${behind}"
 echo "UPSTREAM_TODAY_COUNT=${today_updates}"
 
 if [[ "$behind" == "0" ]]; then
+  if [[ "$origin_synced" == "1" ]]; then
+    ensure_git_identity
+    merged_main_after="$(git -C "$main_repo" rev-parse --short HEAD)"
+    push_branch "$main_repo" "sub2api-main" "$target_branch" "main_push_failed" 42
+    main_after="$(git -C "$main_repo" rev-parse --short HEAD)"
+    echo "MAIN_BEFORE=${main_before}"
+    echo "MAIN_AFTER_MERGE=${merged_main_after}"
+    echo "MAIN_AFTER=${main_after}"
+    updated_repos+=("sub2api-main")
+    if [[ "$merged_main_after" == "$main_after" ]]; then
+      send_progress_notify "主项目已同步 origin/${target_branch}，并已推送。${main_before} -> ${main_after}。"
+    else
+      send_progress_notify "主项目已同步 origin/${target_branch}，并已同步最新 origin 后推送。${main_before} -> ${main_after}。"
+    fi
+
+    backend_before="$(git -C "$backend_repo" rev-parse --short HEAD)"
+    frontend_before="$(git -C "$frontend_repo" rev-parse --short HEAD)"
+
+    if ! "$sync_all_script" >/tmp/qq-update-workspace.sync.log 2>&1; then
+      fail "sync_failed" 43 "这次更新失败，两个子项目同步失败。" "主仓库已 push；$(first_nonempty_line /tmp/qq-update-workspace.sync.log)"
+    fi
+
+    commit_message="chore: sync from sub2api-main ${main_after}"
+    commit_and_push_repo "$backend_repo" "3ms_backend" "$target_branch" "$commit_message" "BACKEND"
+    commit_and_push_repo "$frontend_repo" "3ms_frontend" "$target_branch" "$commit_message" "FRONTEND"
+
+    stage_detail_parts=()
+    if [[ "${#updated_repos[@]}" -gt 1 ]]; then
+      stage_detail_parts+=("已 commit+push：$(join_by '、' "${updated_repos[@]:1}")")
+    fi
+    if [[ "${#unchanged_repos[@]}" -gt 0 ]]; then
+      stage_detail_parts+=("无同步改动：$(join_by '、' "${unchanged_repos[@]}")")
+    fi
+    if [[ "${#updated_repos[@]}" -le 1 ]]; then
+      if [[ "${#stage_detail_parts[@]}" -eq 0 ]]; then
+        send_progress_notify "子项目已完成同步。两个子项目都无同步改动。"
+      else
+        send_progress_notify "子项目已完成同步。$(join_by '；' "${stage_detail_parts[@]}")。"
+      fi
+    else
+      send_progress_notify "子项目已同步并推送完成。$(join_by '；' "${stage_detail_parts[@]}")。"
+    fi
+
+    final_detail_parts=("已 commit+push：$(join_by '、' "${updated_repos[@]}")")
+    if [[ "${#unchanged_repos[@]}" -gt 0 ]]; then
+      final_detail_parts+=("无同步改动：$(join_by '、' "${unchanged_repos[@]}")")
+    fi
+    if [[ "${#discarded_repos[@]}" -gt 0 ]]; then
+      final_detail_parts+=("已丢弃本地改动：$(join_by '、' "${discarded_repos[@]}")")
+    fi
+    final_detail_parts+=("未部署")
+
+    echo "QQ_RESULT=已更新并推送完成。"
+    echo "QQ_DETAIL=$(join_by '；' "${final_detail_parts[@]}")。"
+    echo "RESULT=updated"
+    echo "BACKEND_BEFORE=${backend_before}"
+    echo "BACKEND_AFTER=$(git -C "$backend_repo" rev-parse --short HEAD)"
+    echo "FRONTEND_BEFORE=${frontend_before}"
+    echo "FRONTEND_AFTER=$(git -C "$frontend_repo" rev-parse --short HEAD)"
+    echo "SUB2API_BRANCH_AFTER=$(git -C "$main_repo" branch --show-current)"
+    echo "BACKEND_BRANCH_AFTER=$(git -C "$backend_repo" branch --show-current)"
+    echo "FRONTEND_BRANCH_AFTER=$(git -C "$frontend_repo" branch --show-current)"
+    echo "POST_MAIN_DIRTY=$(test -n "$(git -C "$main_repo" status --porcelain)" && echo 1 || echo 0)"
+    echo "POST_BACKEND_DIRTY=$(test -n "$(git -C "$backend_repo" status --porcelain)" && echo 1 || echo 0)"
+    echo "POST_FRONTEND_DIRTY=$(test -n "$(git -C "$frontend_repo" status --porcelain)" && echo 1 || echo 0)"
+    exit 0
+  fi
+
   echo "QQ_RESULT=不用更新，已经是最新。"
   no_update_detail=()
   if [[ "$today_updates" == "0" ]]; then
@@ -253,7 +497,6 @@ fi
 
 ensure_git_identity
 
-main_before="$(git -C "$main_repo" rev-parse --short HEAD)"
 merge_log="/tmp/qq-update-workspace.merge.log"
 set +e
 git -C "$main_repo" merge --no-ff --no-edit upstream/main >"$merge_log" 2>&1
@@ -274,16 +517,24 @@ if [[ "$merge_exit" -ne 0 ]]; then
   fail "merge_failed" 41 "这次更新失败，主仓库 merge 失败。" "$(first_nonempty_line "$merge_log")"
 fi
 
-main_after="$(git -C "$main_repo" rev-parse --short HEAD)"
-echo "MAIN_BEFORE=${main_before}"
-echo "MAIN_AFTER=${main_after}"
+merged_main_after="$(git -C "$main_repo" rev-parse --short HEAD)"
 
 push_branch "$main_repo" "sub2api-main" "$target_branch" "main_push_failed" 42
+main_after="$(git -C "$main_repo" rev-parse --short HEAD)"
+echo "MAIN_BEFORE=${main_before}"
+echo "MAIN_AFTER_MERGE=${merged_main_after}"
+echo "MAIN_AFTER=${main_after}"
 updated_repos+=("sub2api-main")
-if [[ "$main_before" == "$main_after" ]]; then
+if [[ "$origin_synced" == "1" && "$merged_main_after" == "$main_after" ]]; then
+  send_progress_notify "主项目已先同步 origin/${target_branch}，再合并 upstream/main 并推送。${main_before} -> ${main_after}。"
+elif [[ "$origin_synced" == "1" ]]; then
+  send_progress_notify "主项目已先同步 origin/${target_branch}，再合并 upstream/main，并已同步最新 origin 后推送。${main_before} -> ${main_after}。"
+elif [[ "$main_before" == "$merged_main_after" ]]; then
   send_progress_notify "主项目已经包含 upstream/main，并已推送。"
-else
+elif [[ "$merged_main_after" == "$main_after" ]]; then
   send_progress_notify "主项目已合并 upstream/main 并推送。${main_before} -> ${main_after}。"
+else
+  send_progress_notify "主项目已合并 upstream/main，并已同步 origin 后推送。${main_before} -> ${main_after}。"
 fi
 
 backend_before="$(git -C "$backend_repo" rev-parse --short HEAD)"

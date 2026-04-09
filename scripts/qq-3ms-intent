@@ -512,7 +512,6 @@ commit_and_push_child() {
   local commit_log
 
   if [[ -z "$(repo_status "$repo")" ]]; then
-    unchanged_children+=("$label")
     return 0
   fi
 
@@ -1083,6 +1082,12 @@ handle_pull_main_origin_sync_children_push() {
     else
       echo "QQ_RESULT=主项目本地已领先 $(origin_branch_label)，子项目已同步并推送完成。"
     fi
+  elif [[ "$pull_before" == "$pull_after" ]]; then
+    if [[ "${#pushed_repos[@]}" -eq 0 ]]; then
+      echo "QQ_RESULT=主项目已经和 $(origin_branch_label) 同步，子项目已完成同步。"
+    else
+      echo "QQ_RESULT=主项目已经和 $(origin_branch_label) 同步，子项目已同步并推送完成。"
+    fi
   elif [[ "${#pushed_repos[@]}" -eq 0 ]]; then
     echo "QQ_RESULT=主项目已拉取 $(origin_branch_label)，子项目已完成同步。"
   else
@@ -1184,6 +1189,8 @@ fi
   if [[ -z "$deploy_target_arg" ]]; then
     if [[ "$pull_ahead_count" -gt 0 && "$pull_behind_count" -eq 0 ]]; then
       echo "QQ_RESULT=主项目本地已领先 $(origin_branch_label)，子项目已完成同步。"
+    elif [[ "$pull_before" == "$pull_after" ]]; then
+      echo "QQ_RESULT=主项目已经和 $(origin_branch_label) 同步，子项目已完成同步。"
     else
       echo "QQ_RESULT=主项目已拉取 $(origin_branch_label)，子项目已完成同步。"
     fi
@@ -1208,6 +1215,8 @@ fi
   if [[ "$deploy_exit" -eq 0 ]]; then
     if [[ "$pull_ahead_count" -gt 0 && "$pull_behind_count" -eq 0 ]]; then
       echo "QQ_RESULT=主项目本地已领先 $(origin_branch_label)，子项目已同步并推送，并已触发云效部署。"
+    elif [[ "$pull_before" == "$pull_after" ]]; then
+      echo "QQ_RESULT=主项目已经和 $(origin_branch_label) 同步，子项目已同步并推送，并已触发云效部署。"
     else
       echo "QQ_RESULT=主项目已拉取 $(origin_branch_label)，子项目已同步并推送，并已触发云效部署。"
     fi

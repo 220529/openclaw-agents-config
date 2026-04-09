@@ -4,6 +4,7 @@ set -euo pipefail
 openclaw_state_dir="${OPENCLAW_STATE_DIR:-${HOME:-/root}/.openclaw}"
 openclaw_workspace="${OPENCLAW_WORKSPACE:-${openclaw_state_dir}/workspace}"
 config_path="${QQ_YUNXIAO_DEPLOY_CONFIG:-${openclaw_state_dir}/qq-yunxiao-deploy.conf}"
+runtime_env_path="${OPENCLAW_ENV_FILE:-${HOME:-/root}/.config/openclaw/openclaw.env}"
 notify_to="${1:-}"
 timeout_sec="${2:-1800}"
 poll_interval_sec="${3:-15}"
@@ -17,6 +18,13 @@ targets=("$@")
 
 if [[ ! -f "$config_path" ]]; then
   exit 1
+fi
+
+if [[ -f "$runtime_env_path" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$runtime_env_path"
+  set +a
 fi
 
 # shellcheck disable=SC1090
@@ -118,12 +126,30 @@ PY
 
 send_notify() {
   local text="$1"
-  if "${QQBOT_PROACTIVE_SEND_SCRIPT:-${openclaw_workspace}/bin/qqbot-proactive-send}" "$notify_to" "$text"; then
+  local sender_script="${QQBOT_PROACTIVE_SEND_SCRIPT:-${openclaw_workspace}/bin/qqbot-proactive-send}"
+  local node_bin="${OPENCLAW_NODE_BIN:-}"
+  local notify_log="/tmp/qq-yunxiao-followup.notify.$$.log"
+
+  if [[ -z "$node_bin" ]] && command -v node >/dev/null 2>&1; then
+    node_bin="$(command -v node)"
+  fi
+
+  if [[ -z "$node_bin" || ! -x "$node_bin" ]]; then
+    echo "notify_failed_to=${notify_to}: node_bin_unavailable" >&2
+    return 1
+  fi
+
+  if [[ ! -f "$sender_script" ]]; then
+    echo "notify_failed_to=${notify_to}: sender_script_missing ${sender_script}" >&2
+    return 1
+  fi
+
+  if "$node_bin" "$sender_script" "$notify_to" "$text" >"$notify_log" 2>&1; then
     echo "notify_sent_to=${notify_to}"
     return 0
   fi
 
-  echo "notify_failed_to=${notify_to}" >&2
+  echo "notify_failed_to=${notify_to}: $(sed -n '/[^[:space:]]/ { p; q; }' "$notify_log")" >&2
   return 1
 }
 
