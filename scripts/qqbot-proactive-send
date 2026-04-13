@@ -60,7 +60,8 @@ if (!text) {
 }
 
 const cfg = loadConfig();
-const result = await sendProactive({ to, text, type, accountId: "default" }, cfg);
+const accountId = process.env.QQBOT_ACCOUNT_ID?.trim() || "default";
+const result = await sendProactive({ to, text, type, accountId }, cfg);
 if (!result.success) {
   console.error(result.error || "send failed");
   process.exit(1);

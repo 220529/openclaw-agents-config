@@ -46,6 +46,11 @@ require_nonempty OPENCLAW_NODE_MODULES_DIR
 require_nonempty QQBOT_APP_ID
 require_nonempty QQBOT_CLIENT_SECRET
 
+if [[ "${QQBOT_SECONDARY_ENABLED:-false}" == "true" ]]; then
+  require_nonempty QQBOT_SECONDARY_APP_ID
+  require_nonempty QQBOT_SECONDARY_CLIENT_SECRET
+fi
+
 if [[ -n "${OPENCLAW_NODE_BIN:-}" ]]; then
   require_path_exists "OPENCLAW_NODE_BIN" "${OPENCLAW_NODE_BIN}"
 fi

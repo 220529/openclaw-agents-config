@@ -6,6 +6,24 @@ env_file="${OPENCLAW_CONFIG_ENV:-${HOME}/.config/openclaw/openclaw.env}"
 restart_service="0"
 skip_systemd="${OPENCLAW_SKIP_SYSTEMD:-0}"
 
+copy_dir_contents() {
+  local src_dir="$1"
+  local dest_dir="$2"
+  local item
+  local dest_path
+
+  mkdir -p "$dest_dir"
+  shopt -s dotglob nullglob
+  for item in "$src_dir"/*; do
+    dest_path="${dest_dir}/$(basename "$item")"
+    if [[ -e "$dest_path" ]] && [[ "$(readlink -f "$item")" == "$(readlink -f "$dest_path")" ]]; then
+      continue
+    fi
+    cp -a "$item" "$dest_dir/"
+  done
+  shopt -u dotglob nullglob
+}
+
 for arg in "$@"; do
   case "$arg" in
     --restart)
@@ -47,8 +65,8 @@ mkdir -p \
 
 rm -rf "${codex_home}/skills/3ms-workspace-ops"
 cp -a "${repo_root}/skills/3ms-workspace-ops" "${codex_home}/skills/"
-cp -a "${repo_root}/scripts/." "${openclaw_workspace}/bin/"
-cp -a "${repo_root}/runtime/profiles/qq/." "${openclaw_workspace}/profiles/qq/"
+copy_dir_contents "${repo_root}/scripts" "${openclaw_workspace}/bin"
+copy_dir_contents "${repo_root}/runtime/profiles/qq" "${openclaw_workspace}/profiles/qq"
 cp "${repo_root}/env/qq-yunxiao-deploy.conf.example" "${openclaw_workspace}/.openclaw/qq-yunxiao-deploy.conf.example"
 
 chmod +x \

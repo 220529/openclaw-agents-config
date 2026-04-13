@@ -407,6 +407,7 @@ run_create_pipeline() {
 spawn_finish_notify() {
   local watcher_script="${openclaw_workspace}/bin/qq-yunxiao-followup"
   local unit_name
+  local notify_account_id
   local random_suffix
 
   if ! bool_true "$notify_enabled"; then
@@ -424,9 +425,11 @@ spawn_finish_notify() {
 
   random_suffix="$(date +%s)-$$-$RANDOM"
   unit_name="qq-yunxiao-followup-${random_suffix}"
+  notify_account_id="${QQBOT_ACCOUNT_ID:-default}"
 
   if command -v systemd-run >/dev/null 2>&1; then
     systemd-run --user --unit "$unit_name" --collect \
+      --setenv=QQBOT_ACCOUNT_ID="${notify_account_id}" \
       "$watcher_script" \
       "$notify_to" \
       "$notify_timeout_sec" \

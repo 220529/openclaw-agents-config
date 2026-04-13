@@ -164,6 +164,11 @@ fail() {
   exit "$exit_code"
 }
 
+conflict_detail() {
+  local preview="$1"
+  printf '冲突已中止，已回到执行前的未合并状态。请先在本地解决冲突后，再发口令。文件：%s' "$preview"
+}
+
 normalize_intent() {
   case "$1" in
     1|check-upstream-status|check-upstream|upstream-status|"看上游更新")
@@ -592,7 +597,7 @@ run_merge_upstream() {
       if [[ "$conflict_count" -gt 5 ]]; then
         conflict_preview="${conflict_preview} 等 ${conflict_count} 个文件"
       fi
-      fail "merge_conflict" 23 "这次更新失败，主仓库 merge 出现冲突。" "冲突已中止，文件：${conflict_preview}"
+      fail "merge_conflict" 23 "这次更新失败，主仓库 merge 出现冲突。" "$(conflict_detail "$conflict_preview")"
     fi
 
     fail "merge_failed" 24 "这次更新失败，主仓库 merge 失败。" "$(best_error_line "$merge_log")"
@@ -642,7 +647,7 @@ run_pull_main_origin() {
       if [[ "$conflict_count" -gt 5 ]]; then
         conflict_preview="${conflict_preview} 等 ${conflict_count} 个文件"
       fi
-      fail "origin_merge_conflict" 26 "这次没法继续，主仓库 git pull origin 出现冲突。" "冲突已中止，文件：${conflict_preview}"
+      fail "origin_merge_conflict" 26 "这次没法继续，主仓库 git pull origin 出现冲突。" "$(conflict_detail "$conflict_preview")"
     fi
 
     fail "pull_origin_failed" 27 "这次没法继续，主仓库 git pull origin 失败。" "$(best_error_line "$pull_log")"

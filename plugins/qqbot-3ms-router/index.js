@@ -123,7 +123,10 @@ async function run3msIntent(api, intentScriptPath, content, timeoutMs, logger, a
 	const result = await api.runtime.system.runCommandWithTimeout([intentScriptPath, content], {
 		timeoutMs,
 		cwd: resolveWorkspacePath(),
-		env: process.env
+		env: {
+			...process.env,
+			QQBOT_ACCOUNT_ID: accountId
+		}
 	});
 	if (result.termination === "timeout" || result.killed) return "这次执行超时了，请稍后再试。";
 	if (result.code !== 0) return formatFailureReply(result.stdout, result.stderr);

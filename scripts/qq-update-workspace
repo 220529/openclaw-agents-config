@@ -97,6 +97,11 @@ fail() {
   exit "$exit_code"
 }
 
+conflict_detail() {
+  local preview="$1"
+  printf '冲突已中止，已回到执行前的未合并状态。请先在本地解决冲突后，再发口令。文件：%s' "$preview"
+}
+
 repo_status() {
   local repo="$1"
   git -C "$repo" status --porcelain
@@ -240,7 +245,7 @@ sync_repo_from_origin_for_push_retry() {
       if [[ "$conflict_count" -gt 5 ]]; then
         conflict_preview="${conflict_preview} 等 ${conflict_count} 个文件"
       fi
-      fail "${safe_label}_origin_pull_conflict" 32 "这次更新失败，${label} push 前补拉 origin 出现冲突。" "冲突已中止，文件：${conflict_preview}"
+      fail "${safe_label}_origin_pull_conflict" 32 "这次更新失败，${label} push 前补拉 origin 出现冲突。" "$(conflict_detail "$conflict_preview")"
     fi
 
     fail "${safe_label}_origin_pull_failed" 33 "这次更新失败，${label} push 前补拉 origin 失败。" "$(best_error_line "$pull_log")"
@@ -286,7 +291,7 @@ sync_main_repo_from_origin_before_upstream() {
       if [[ "$conflict_count" -gt 5 ]]; then
         conflict_preview="${conflict_preview} 等 ${conflict_count} 个文件"
       fi
-      fail "origin_pull_conflict" 34 "这次更新失败，主仓库 git pull origin 出现冲突。" "冲突已中止，文件：${conflict_preview}"
+      fail "origin_pull_conflict" 34 "这次更新失败，主仓库 git pull origin 出现冲突。" "$(conflict_detail "$conflict_preview")"
     fi
 
     fail "origin_pull_failed" 35 "这次更新失败，主仓库 git pull origin 失败。" "$(best_error_line "$pull_log")"
@@ -511,7 +516,7 @@ if [[ "$merge_exit" -ne 0 ]]; then
     if [[ "$conflict_count" -gt 5 ]]; then
       conflict_preview="${conflict_preview} 等 ${conflict_count} 个文件"
     fi
-    fail "merge_conflict" 40 "这次更新失败，主仓库 merge 出现冲突。" "冲突已中止，文件：${conflict_preview}"
+    fail "merge_conflict" 40 "这次更新失败，主仓库 merge 出现冲突。" "$(conflict_detail "$conflict_preview")"
   fi
 
   fail "merge_failed" 41 "这次更新失败，主仓库 merge 失败。" "$(first_nonempty_line "$merge_log")"
