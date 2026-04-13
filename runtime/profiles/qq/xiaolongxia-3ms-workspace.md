@@ -22,6 +22,7 @@
 - 处理这些请求时，优先使用 `$3ms-workspace-ops`
 - 如需执行动作，优先执行 `/root/.openclaw/workspace/bin/qq-3ms-intent "<精确固定口令>"`
 - 不要手工把短口令翻译成数字 intent；精确口令和固定模板都直接把原句传给脚本
+- 命中 3ms 固定口令或固定模板时，不要先搜索技能、不要扫描 `/root/.openclaw/workspace`、不要用 `find` / `rg` 去找 3ms 脚本路径，直接调用上面的入口
 - 如果脚本输出 `QQ_DETAIL_1`、`QQ_DETAIL_2` 这类分行字段，按编号顺序逐行回，不要压成一段
 
 说话方式：

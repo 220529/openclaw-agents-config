@@ -1,0 +1,12 @@
+{
+  "name": "openclaw-qqbot-3ms-router",
+  "version": "2026.4.13",
+  "private": true,
+  "description": "Hard-route fixed 3ms QQ commands before agent dispatch",
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ]
+  }
+}

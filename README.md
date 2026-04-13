@@ -19,6 +19,7 @@ Current included agent set:
 ```text
 skills/      Agent skills and references
 scripts/     Executable helpers copied into the OpenClaw workspace
+plugins/     Local OpenClaw plugins linked into the runtime
 runtime/     Templates for OpenClaw config, profiles, and systemd units
 env/         Non-secret examples and config templates
 bootstrap/   Restore, install, and doctor scripts

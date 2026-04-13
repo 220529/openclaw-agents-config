@@ -1,0 +1,33 @@
+{
+  "id": "qqbot-3ms-router",
+  "enabledByDefault": true,
+  "name": "QQBot 3ms Router",
+  "description": "Hard-route fixed 3ms QQ commands before agent dispatch.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "accountIds": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": [
+          "default"
+        ]
+      },
+      "intentScriptPath": {
+        "type": "string"
+      },
+      "timeoutMs": {
+        "type": "number",
+        "minimum": 1000,
+        "default": 240000
+      },
+      "requireSystemPromptMarker": {
+        "type": "boolean",
+        "default": true
+      }
+    }
+  }
+}

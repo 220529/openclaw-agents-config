@@ -62,6 +62,12 @@ python3 "${repo_root}/bootstrap/render_template.py" \
   "${repo_root}/runtime/openclaw/openclaw.json.template" \
   "${openclaw_state_dir}/openclaw.json"
 
+if command -v openclaw >/dev/null 2>&1; then
+  if ! openclaw plugins inspect qqbot-3ms-router >/dev/null 2>&1; then
+    openclaw plugins install --link "${repo_root}/plugins/qqbot-3ms-router"
+  fi
+fi
+
 python3 "${repo_root}/bootstrap/render_template.py" \
   "${repo_root}/runtime/systemd/openclaw-gateway.service.template" \
   "${systemd_user_dir}/openclaw-gateway.service"
@@ -78,3 +84,4 @@ echo "  skill: ${codex_home}/skills/3ms-workspace-ops"
 echo "  workspace: ${openclaw_workspace}"
 echo "  config: ${openclaw_state_dir}/openclaw.json"
 echo "  service: ${systemd_user_dir}/openclaw-gateway.service"
+echo "  plugin: ${repo_root}/plugins/qqbot-3ms-router"

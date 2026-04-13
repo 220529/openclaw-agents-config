@@ -35,5 +35,8 @@ done
 
 python3 -m json.tool "${openclaw_state_dir}/openclaw.json" >/dev/null
 bash -n "${openclaw_workspace}/bin/qq-3ms-intent"
+if command -v openclaw >/dev/null 2>&1; then
+  openclaw plugins inspect qqbot-3ms-router >/dev/null
+fi
 
 echo "doctor ok"
